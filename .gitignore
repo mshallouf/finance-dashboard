@@ -20,7 +20,7 @@ venv/
 Thumbs.db
 
 # --- Project Data (local storage) ---
-transactions.csv
+sample_transactions.csv
 budgets.json
 accounts.json
 categories.json
