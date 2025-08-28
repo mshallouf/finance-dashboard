@@ -7,7 +7,7 @@ from datetime import datetime as dt
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QLabel, QPushButton,
-    QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QMessageBox, QMenu,
+    QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QMessageBox, QMenu,QMenuBar, QMessageBox,
     QTabWidget, QHBoxLayout, QComboBox, QDateEdit, QGroupBox, QGridLayout,
     QProgressBar
 )
@@ -367,10 +367,13 @@ class FinanceApp(QWidget):
         super().__init__()
         self.setWindowTitle("My Finance Tool")
         self.setGeometry(80, 80, 1300, 900)
+
+        # Root layout for the whole window (QWidget doesn't have .menuBar())
         self.layout = QVBoxLayout(self)
 
         # ------- Load Data -------
         self.df = self.load_transactions()
+        self.repair_transaction_ids(save=True)
         self.budgets = self.migrate_budgets(self.load_json(BUDGET_FILE, default={}))
         self.accounts = self.ensure_accounts_fields(self.load_json(ACCOUNTS_FILE, default=[]))
         self.settings = self.load_json(SETTINGS_FILE, default={"today_override": None})
@@ -380,6 +383,21 @@ class FinanceApp(QWidget):
         self.dashboard_filter_mode = "This Month"
         self.dashboard_from_date = None
         self.dashboard_to_date = None
+
+        # === Menu Bar for QWidget ===
+        self.menubar = QMenuBar(self)
+        file_menu = self.menubar.addMenu("&File")
+
+        # Import option 🚀
+        act_import = file_menu.addAction("Import Transactions…")
+        act_import.triggered.connect(self.open_import_wizard)
+
+        file_menu.addSeparator()
+        act_exit = file_menu.addAction("Exit")
+        act_exit.triggered.connect(self.close)
+
+        # Attach the menubar to the top of the QWidget via its layout
+        self.layout.setMenuBar(self.menubar)
 
         # ------- Tabs (Dashboard first) -------
         self.tabs = QTabWidget()
@@ -421,6 +439,30 @@ class FinanceApp(QWidget):
         self.init_settings_tab()
 
         self.tabs.currentChanged.connect(self.on_tab_change)
+
+    # Import wizard call
+    def open_import_wizard(self):
+        try:
+            from import_wizard import ImportWizard
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Could not load import wizard:\n{e}")
+            return
+
+        dlg = ImportWizard(self)
+        dlg.exec()  # Import wizard appends to CSV on "Commit"
+
+        # After dialog closes, reload from disk, repair Ids, and refresh UI
+        try:
+            self.df = self.load_transactions()
+            self.repair_transaction_ids(save=True)
+            self.update_table()
+            self.update_summary()
+            self.update_budgets_table()
+            self.update_dashboard_tab()
+            self.refresh_reports()
+        except Exception as e:
+            QMessageBox.warning(self, "Import", f"Imported, but refresh encountered an issue:\n{e}")
+
 
     # ---------------- Data utils ----------------
     def load_json(self, filename, default):
@@ -587,6 +629,42 @@ class FinanceApp(QWidget):
         df_out['AppliedToBalance'] = df_out['AppliedToBalance'].map(lambda x: "True" if bool(x) else "False")
         df_out[cols].to_csv(TRANSACTIONS_FILE, index=False)
 
+    def repair_transaction_ids(self, save: bool = False):
+        """
+        Ensure every row in self.df has a unique, non-empty Id (as string).
+        Assigns incrementing Ids for any blank/NaN/duplicate Ids.
+        """
+        if self.df.empty:
+            return
+
+        # Normalize to string and strip
+        if "Id" not in self.df.columns:
+            self.df["Id"] = ""
+
+        ids = self.df["Id"].astype(str).fillna("").str.strip()
+
+        # Find next numeric seed
+        numeric_ids = pd.to_numeric(ids, errors="coerce").dropna()
+        next_id = (int(numeric_ids.max()) + 1) if not numeric_ids.empty else 1
+
+        # Track seen Ids to avoid duplicates
+        seen = set()
+        new_ids = []
+        for raw in ids.tolist():
+            if raw == "" or raw in seen:
+                new_ids.append(str(next_id))
+                seen.add(str(next_id))
+                next_id += 1
+            else:
+                new_ids.append(raw)
+                seen.add(raw)
+
+        self.df["Id"] = new_ids
+
+        if save:
+            self.save_transactions()
+
+
     def get_today(self) -> datetime.date:
         ov = self.settings.get("today_override")
         if ov:
@@ -665,6 +743,11 @@ class FinanceApp(QWidget):
 
         # ---- Table
         self.table = QTableWidget()
+        # Make selection operate on full rows (so Edit/Delete can find the right Id)
+        from PySide6.QtWidgets import QAbstractItemView  # ok to repeat import; or move to top
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+
         layout.addWidget(self.table)
 
         # ---- Buttons row
@@ -672,9 +755,13 @@ class FinanceApp(QWidget):
         self.add_button = QPushButton("Add")
         self.edit_button = QPushButton("Edit")
         self.delete_button = QPushButton("Delete")
+        self.clear_tx_button = QPushButton("Clear All")  # NEW
+
         btn_row.addWidget(self.add_button)
         btn_row.addWidget(self.edit_button)
         btn_row.addWidget(self.delete_button)
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self.clear_tx_button)  # NEW
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -690,6 +777,7 @@ class FinanceApp(QWidget):
         self.add_button.clicked.connect(self.add_transaction)
         self.edit_button.clicked.connect(self._edit_selected_transaction)
         self.delete_button.clicked.connect(self._delete_selected_transaction)
+        self.clear_tx_button.clicked.connect(self.clear_all_transactions)  # NEW
 
         self.trans_tab.setLayout(layout)
 
@@ -839,14 +927,12 @@ class FinanceApp(QWidget):
             lines.append(f"{cat}: {fmt_money(total)}")
         self.summary_label.setText("\n".join(lines))
 
-    def _next_tx_id(self) -> str:
-        if self.df.empty or self.df['Id'].isna().all():
-            return "1"
-        try:
-            m = self.df['Id'].astype(int).max()
-            return str(m + 1)
-        except Exception:
-            return str(len(self.df) + 1)
+    def _next_tx_id(self):
+        if self.df.empty or "Id" not in self.df.columns:
+            return 1
+        ids = pd.to_numeric(self.df["Id"], errors="coerce").dropna()
+        return int(ids.max()) + 1 if not ids.empty else 1
+
 
     def _account_names(self):
         return [a["name"] for a in self.accounts] if self.accounts else ["Unassigned"]
@@ -894,20 +980,45 @@ class FinanceApp(QWidget):
         }
         self.df.loc[len(self.df)] = new_row
         self.save_and_refresh()
+    
+    def refresh_all(self):
+        """UI refresh hook used by the import wizard."""
+        # Do NOT save here; just refresh views from current in-memory data.
+        self.update_table()
+        self.update_summary()
+        self.update_budgets_table()
+        self.update_accounts_table()
+        self.update_categories_table()
+        self.update_dashboard_tab()
+        self.refresh_reports()
+
 
     def _selected_row_id(self) -> str | None:
+        """
+        Returns the Id (as a string) for the currently selected row in the Transactions table.
+        First, try to read the hidden 'Id' column directly; if not found, fall back to
+        mapping the selected row index back to the filtered+sorted DataFrame.
+        """
         row = self.table.currentRow()
         if row < 0:
             return None
+
+        # Preferred: read hidden Id column directly
         for c in range(self.table.columnCount()):
-            header = self.table.horizontalHeaderItem(c).text()
-            if header == "Id":
+            header_item = self.table.horizontalHeaderItem(c)
+            if header_item and header_item.text() == "Id":
                 item = self.table.item(row, c)
-                return item.text() if item else None
+                if item and item.text():
+                    return item.text()
+                break
+
+        # Fallback: map row -> filtered+sorted df and read its Id
         filtered_df = self.sort_transactions_df(self.get_filtered_transactions())
-        if row < len(filtered_df) and "Id" in filtered_df.columns:
+        if 0 <= row < len(filtered_df) and "Id" in filtered_df.columns:
             return str(filtered_df.iloc[row]["Id"])
+
         return None
+
 
     def _edit_selected_transaction(self):
         row_id = self._selected_row_id()
@@ -936,6 +1047,24 @@ class FinanceApp(QWidget):
             self._edit_transaction_by_id(row_id)
         elif action == a_del and row_id:
             self._delete_transaction_by_id(row_id)
+    
+    def clear_all_transactions(self):
+        if self.df.empty:
+            QMessageBox.information(self, "Clear Transactions", "There are no transactions to clear.")
+            return
+        reply = QMessageBox.question(
+            self, "Clear ALL Transactions",
+            "This will delete ALL transactions and cannot be undone.\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Recreate empty dataframe with the expected columns
+        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']
+        self.df = pd.DataFrame(columns=cols)
+        self.save_and_refresh()
+        QMessageBox.information(self, "Transactions", "All transactions cleared.")
 
     def _edit_transaction_by_id(self, row_id: str):
         matches = self.df.index[self.df['Id'].astype(str) == str(row_id)]
@@ -1013,12 +1142,16 @@ class FinanceApp(QWidget):
         row_btns = QHBoxLayout()
         btn_edit = QPushButton("Add/Edit Budget")
         btn_remove = QPushButton("Remove Budget")
+        btn_clear = QPushButton("Clear All")  # NEW
         row_btns.addWidget(btn_edit)
         row_btns.addWidget(btn_remove)
+        row_btns.addSpacing(12)
+        row_btns.addWidget(btn_clear)  # NEW
         layout.addLayout(row_btns)
 
         btn_edit.clicked.connect(self.add_edit_budget)
         btn_remove.clicked.connect(self.remove_budget)
+        btn_clear.clicked.connect(self.clear_all_budgets)  # NEW
 
         self.budget_tab.setLayout(layout)
         self.update_budgets_table()
@@ -1092,6 +1225,24 @@ class FinanceApp(QWidget):
         self.update_budgets_table()
         self.update_dashboard_tab()
 
+    def clear_all_budgets(self):
+        if not self.budgets:
+            QMessageBox.information(self, "Clear Budgets", "There are no budgets to clear.")
+            return
+        reply = QMessageBox.question(
+            self, "Clear ALL Budgets",
+            "This will remove ALL budgets and cannot be undone.\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.budgets = {}
+        self.save_json(BUDGET_FILE, self.budgets)
+        self.update_budgets_table()
+        self.update_dashboard_tab()
+        QMessageBox.information(self, "Budgets", "All budgets cleared.")
+
+
     # ---------------- Accounts Tab ----------------
     def init_accounts_tab(self):
         layout = QVBoxLayout()
@@ -1105,11 +1256,15 @@ class FinanceApp(QWidget):
         btn_add = QPushButton("Add Account")
         btn_edit = QPushButton("Edit Account")
         btn_del = QPushButton("Delete Account")
+        btn_clear = QPushButton("Clear All")              # NEW
         btn_apply = QPushButton("Apply New Transactions")
         btn_recalc = QPushButton("Recalculate Balances")
+
         row_btns.addWidget(btn_add)
         row_btns.addWidget(btn_edit)
         row_btns.addWidget(btn_del)
+        row_btns.addSpacing(12)
+        row_btns.addWidget(btn_clear)                      # NEW
         row_btns.addStretch()
         row_btns.addWidget(btn_apply)
         row_btns.addWidget(btn_recalc)
@@ -1118,8 +1273,10 @@ class FinanceApp(QWidget):
         btn_add.clicked.connect(self.add_account)
         btn_edit.clicked.connect(self.edit_account)
         btn_del.clicked.connect(self.delete_account)
+        btn_clear.clicked.connect(self.clear_all_accounts)  # NEW
         btn_apply.clicked.connect(self.apply_new_transactions_to_balances)
         btn_recalc.clicked.connect(self.recalculate_balances_from_start)
+
 
         self.accounts_tab.setLayout(layout)
         self.update_accounts_table()
@@ -1187,6 +1344,24 @@ class FinanceApp(QWidget):
         self.save_json(ACCOUNTS_FILE, self.accounts)
         self.update_accounts_table()
         self.update_dashboard_tab()
+
+    def clear_all_accounts(self):
+        if not self.accounts:
+            QMessageBox.information(self, "Clear Accounts", "There are no accounts to clear.")
+            return
+        reply = QMessageBox.question(
+            self, "Clear ALL Accounts",
+            "This will delete ALL accounts and cannot be undone.\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.accounts = []
+        self.save_json(ACCOUNTS_FILE, self.accounts)
+        self.update_accounts_table()
+        self.update_dashboard_tab()
+        QMessageBox.information(self, "Accounts", "All accounts cleared.")
+
 
     # ------- Balance Adjuster Logic -------
     def apply_new_transactions_to_balances(self):
@@ -1268,15 +1443,20 @@ class FinanceApp(QWidget):
         btn_add = QPushButton("Add Category")
         btn_edit = QPushButton("Edit Category")
         btn_del = QPushButton("Delete Category")
+        btn_clear = QPushButton("Clear All")  # NEW
         btns.addWidget(btn_add)
         btns.addWidget(btn_edit)
         btns.addWidget(btn_del)
+        btns.addSpacing(12)
+        btns.addWidget(btn_clear)             # NEW
         btns.addStretch()
         layout.addLayout(btns)
+
 
         btn_add.clicked.connect(self.add_category)
         btn_edit.clicked.connect(self.edit_category)
         btn_del.clicked.connect(self.delete_category)
+        btn_clear.clicked.connect(self.clear_all_categories)  # NEW
 
         self.categories_tab.setLayout(layout)
         self.update_categories_table()
@@ -1401,6 +1581,37 @@ class FinanceApp(QWidget):
         self.save_json(CATEGORIES_FILE, self.categories)
         self.update_categories_table()
         self.save_and_refresh()
+    
+    def clear_all_categories(self):
+        # Protect against leaving transactions with dangling categories:
+        # we reset categories to only 'Uncategorized' and remap all tx to it.
+        reply = QMessageBox.question(
+            self, "Clear ALL Categories",
+            "This will remove ALL categories and set every transaction's Category to 'Uncategorized'.\n"
+            "This cannot be undone.\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Reset category list
+        self.categories = [{"name": "Uncategorized", "type": "Expense"}]
+        self.save_json(CATEGORIES_FILE, self.categories)
+
+        # Remap all transactions to 'Uncategorized'
+        if not self.df.empty and "Category" in self.df.columns:
+            self.df["Category"] = "Uncategorized"
+            self.save_transactions()
+
+        # Remove any budgets (optional—but recommended because their categories vanish)
+        if self.budgets:
+            self.budgets = {}
+            self.save_json(BUDGET_FILE, self.budgets)
+
+        self.update_categories_table()
+        self.save_and_refresh()
+        QMessageBox.information(self, "Categories", "All categories cleared (transactions set to 'Uncategorized').")
+
 
     # ---------------- Dashboard Tab ----------------
     def init_dashboard_tab(self):

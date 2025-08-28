@@ -1,0 +1,583 @@
+# import_wizard.py
+import os, json, shutil, datetime
+import pandas as pd
+from datetime import datetime as dt
+
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog,
+    QStackedWidget, QFormLayout, QComboBox, QCheckBox, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QDialogButtonBox, QMessageBox
+)
+from PySide6.QtCore import Qt
+
+IMPORT_PROFILES_FILE = "import_profiles.json"
+
+DATE_FORMAT_CHOICES = [
+    ("Auto", None),
+    ("YYYY-MM-DD", "%Y-%m-%d"),
+    ("MM/DD/YYYY", "%m/%d/%Y"),
+    ("DD/MM/YYYY", "%d/%m/%Y"),
+    ("YYYY/MM/DD", "%Y/%m/%d"),
+    ("DD-MMM-YYYY", "%d-%b-%Y"),
+]
+
+HEADER_FAMILIES = {
+    "date": {"date", "posted", "transaction date", "date posted", "value date"},
+    "vendor": {"description", "payee", "merchant", "name", "narrative", "details", "transaction"},
+    "amount": {"amount", "amt", "value"},
+    "debit": {"debit", "withdrawal", "payment", "charge", "spent"},
+    "credit": {"credit", "deposit", "received"},
+    "memo": {"memo", "note", "additional", "reference"},
+    "balance": {"balance", "running balance", "current balance"},
+    "external_id": {"id", "reference", "ref", "fitid", "transaction id", "trans id"},
+    "type": {"type", "dr/cr", "debit/credit", "transaction type"}
+}
+
+def load_profiles():
+    if os.path.exists(IMPORT_PROFILES_FILE):
+        try:
+            with open(IMPORT_PROFILES_FILE, "r") as f:
+                return json.load(f).get("profiles", [])
+        except Exception:
+            return []
+    return []
+
+def save_profiles(profiles):
+    with open(IMPORT_PROFILES_FILE, "w") as f:
+        json.dump({"profiles": profiles}, f, indent=2)
+
+def normalize_headers(headers):
+    return [str(h).strip() for h in headers]
+
+def lower_headers(headers):
+    return [str(h).strip().lower() for h in headers]
+
+def guess_mapping(headers):
+    headers_norm = normalize_headers(headers)
+    headers_lower = lower_headers(headers)
+    date_col = vendor_col = amount_col = debit_col = credit_col = memo_col = ext_col = bal_col = type_col = ""
+
+    for i, h in enumerate(headers_lower):
+        if not date_col and any(k in h for k in HEADER_FAMILIES["date"]): date_col = headers_norm[i]
+        if not vendor_col and any(k in h for k in HEADER_FAMILIES["vendor"]): vendor_col = headers_norm[i]
+        if not amount_col and any(k in h for k in HEADER_FAMILIES["amount"]): amount_col = headers_norm[i]
+        if not debit_col and any(k in h for k in HEADER_FAMILIES["debit"]): debit_col = headers_norm[i]
+        if not credit_col and any(k in h for k in HEADER_FAMILIES["credit"]): credit_col = headers_norm[i]
+        if not memo_col and any(k in h for k in HEADER_FAMILIES["memo"]): memo_col = headers_norm[i]
+        if not ext_col and any(k in h for k in HEADER_FAMILIES["external_id"]): ext_col = headers_norm[i]
+        if not bal_col and any(k in h for k in HEADER_FAMILIES["balance"]): bal_col = headers_norm[i]
+        if not type_col and any(k in h for k in HEADER_FAMILIES["type"]): type_col = headers_norm[i]
+
+    amount_mode = "single_amount"
+    if debit_col and credit_col: amount_mode = "debit_credit"
+    elif not amount_col and (debit_col or credit_col): amount_mode = "debit_credit"
+
+    return {
+        "date": date_col, "vendor": vendor_col,
+        "amount_mode": amount_mode, "amount": amount_col,
+        "debit": debit_col, "credit": credit_col,
+        "memo": memo_col, "external_id": ext_col, "balance": bal_col, "type": type_col,
+        "date_format": None, "strip_currency": True, "paren_negative": True, "thousands_sep": True, "invert_amount": False
+    }
+
+def match_profile(headers, ext, profiles):
+    hl = set(lower_headers(headers))
+    best = None; best_overlap = -1
+    for p in profiles:
+        fp = p.get("fingerprint", {})
+        req = set([str(h).lower() for h in fp.get("headers", [])])
+        if fp.get("ext") and fp.get("ext").lower() != ext.lower(): continue
+        overlap = len(hl.intersection(req))
+        if overlap > best_overlap:
+            best_overlap = overlap; best = p
+    return best if best and best_overlap >= 2 else None
+
+def parse_date_value(val, fmt):
+    if val is None or str(val).strip() == "": return None
+    s = str(val).strip()
+    if fmt:
+        try: return dt.strptime(s, fmt).date()
+        except Exception: return None
+    try:
+        d = pd.to_datetime(s, errors="coerce", dayfirst=False)
+        if pd.isna(d): d = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        return None if pd.isna(d) else d.date()
+    except Exception:
+        return None
+
+def parse_amount_value(val, strip_currency=True, paren_negative=True, thousands_sep=True, invert=False):
+    if val is None: return None
+    s = str(val).strip()
+    if s == "": return None
+    neg = False
+    if paren_negative and s.startswith("(") and s.endswith(")"):
+        neg = True; s = s[1:-1]
+    if strip_currency:
+        for sym in ["$", "€", "£", "CAD", "USD"]: s = s.replace(sym, "")
+    s = s.replace(" ", "")
+    if thousands_sep: s = s.replace(",", "")
+    try:
+        num = float(s)
+        if neg: num = -abs(num)
+        if invert: num = -num
+        return num
+    except Exception:
+        return None
+
+def compute_amount_from_dc(debit, credit, **opts):
+    d = parse_amount_value(debit, **opts) if debit not in [None, ""] else 0.0
+    c = parse_amount_value(credit, **opts) if credit not in [None, ""] else 0.0
+    return (c or 0.0) - (d or 0.0)
+
+def clean_vendor(val):
+    return " ".join(str(val or "").split())
+
+def dup_key(row):
+    ext = (row.get("ExternalId") or "").strip()
+    if ext: return f"ext::{ext}"
+    date = row.get("Date") or ""
+    vendor = (row.get("Vendor") or "").lower().strip()
+    try: amount = f"{float(row.get('Amount',0.0)):.2f}"
+    except Exception: amount = "0.00"
+    acct = row.get("Account") or ""
+    return f"{date}|{vendor}|{amount}|{acct}"
+
+class ImportWizard(QDialog):
+    def __init__(self, parent_app):
+        super().__init__(parent_app)
+        self.app = parent_app
+        self.setWindowTitle("Import Transactions")
+        self.resize(920, 640)
+
+        self.profiles = load_profiles()
+        self.file_path = ""; self.file_ext = ""; self.raw_df = None; self.headers = []
+        self.mapping = {}; self.account_choice = ""
+        self.preview_rows = []; self.preview_flags = []
+
+        # Stack
+        self.stack = QStackedWidget(self)
+        outer = QVBoxLayout(self); outer.addWidget(self.stack)
+
+        # Nav
+        nav = QHBoxLayout()
+        self.btn_back = QPushButton("Back")
+        self.btn_next = QPushButton("Next")
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_import = QPushButton("Commit")
+        nav.addWidget(self.btn_back); nav.addWidget(self.btn_next); nav.addStretch()
+        nav.addWidget(self.btn_cancel); nav.addWidget(self.btn_import)
+        outer.addLayout(nav)
+        self.btn_back.clicked.connect(self.on_back)
+        self.btn_next.clicked.connect(self.on_next)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_import.clicked.connect(self.on_commit)
+
+        # --- Step 1: pick file
+        self.step1 = QDialog(self); s1 = QVBoxLayout(self.step1)
+        s1.addWidget(QLabel("Select a CSV / XLS / XLSX file to import."))
+        row = QHBoxLayout()
+        self.path_edit = QLineEdit(); self.path_edit.setReadOnly(True)
+        self.btn_browse = QPushButton("Browse…"); row.addWidget(self.path_edit); row.addWidget(self.btn_browse)
+        self.detect_label = QLabel("")
+        s1.addLayout(row); s1.addWidget(self.detect_label)
+        self.btn_browse.clicked.connect(self.choose_file)
+        self.stack.addWidget(self.step1)
+
+        # --- Step 2: mapping
+        self.step2 = QDialog(self); s2 = QFormLayout(self.step2)
+
+        self.map_date = QComboBox(); self.map_vendor = QComboBox()
+        self.amount_mode = QComboBox(); self.amount_mode.addItems(["Single Amount column", "Debit/Credit columns"])
+        self.map_amount = QComboBox(); self.map_debit = QComboBox(); self.map_credit = QComboBox()
+
+        self.date_format = QComboBox()
+        for label, _fmt in DATE_FORMAT_CHOICES: self.date_format.addItem(label)
+
+        self.chk_strip_currency = QCheckBox("Strip currency symbols"); self.chk_strip_currency.setChecked(True)
+        self.chk_paren_negative = QCheckBox("Parentheses indicate negative"); self.chk_paren_negative.setChecked(True)
+        self.chk_thousands = QCheckBox("Remove thousands separators"); self.chk_thousands.setChecked(True)
+        self.chk_invert = QCheckBox("Invert sign for Amount (rare)")
+
+        self.map_memo = QComboBox(); self.map_external_id = QComboBox(); self.map_balance = QComboBox(); self.map_type = QComboBox()
+
+        self.account_combo = QComboBox()
+        self.account_combo.addItems([a["name"] for a in self.app.accounts] + ["➕ Add new account…"])
+        self.account_combo.currentTextChanged.connect(self.on_account_changed)
+
+        self.chk_remember = QCheckBox("Remember this mapping as a profile")
+        self.profile_name_edit = QLineEdit(); self.profile_name_edit.setPlaceholderText("Profile name")
+
+        s2.addRow(QLabel("<b>Required</b>"))
+        s2.addRow("Date column:", self.map_date)
+        s2.addRow("Vendor/Description column:", self.map_vendor)
+        s2.addRow("Amount mode:", self.amount_mode)
+        s2.addRow("Amount column (if single):", self.map_amount)
+        s2.addRow("Debit column (if D/C):", self.map_debit)
+        s2.addRow("Credit column (if D/C):", self.map_credit)
+
+        s2.addRow(QLabel("<b>Date & Amount Options</b>"))
+        s2.addRow("Date format:", self.date_format)
+        s2.addRow(self.chk_strip_currency)
+        s2.addRow(self.chk_paren_negative)
+        s2.addRow(self.chk_thousands)
+        s2.addRow(self.chk_invert)
+
+        s2.addRow(QLabel("<b>Optional</b>"))
+        s2.addRow("Memo/Notes:", self.map_memo)
+        s2.addRow("External Id:", self.map_external_id)
+        s2.addRow("Balance:", self.map_balance)
+        s2.addRow("Type:", self.map_type)
+
+        s2.addRow(QLabel("<b>Assign to Account (all rows)</b>"))
+        s2.addRow("Account:", self.account_combo)
+
+        s2.addRow(QLabel("<b>Profile</b>"))
+        s2.addRow(self.chk_remember)
+        s2.addRow("Profile name:", self.profile_name_edit)
+
+        self.amount_mode.currentTextChanged.connect(self.on_amount_mode_changed)
+
+        self.stack.addWidget(self.step2)
+
+        # --- Step 3: preview
+        self.step3 = QDialog(self); s3 = QVBoxLayout(self.step3)
+        self.preview_table = QTableWidget(); self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.preview_info = QLabel("")
+        s3.addWidget(self.preview_table); s3.addWidget(self.preview_info)
+        self.stack.addWidget(self.step3)
+
+        self.stack.setCurrentIndex(0); self._update_nav()
+
+    # ---------- Navigation
+    def _update_nav(self):
+        idx = self.stack.currentIndex()
+        self.btn_back.setEnabled(idx > 0)
+        self.btn_next.setEnabled(idx < self.stack.count() - 1)
+        self.btn_import.setEnabled(idx == self.stack.count() - 1)
+
+    def on_back(self):
+        self.stack.setCurrentIndex(self.stack.currentIndex() - 1)
+        self._update_nav()
+
+    def on_next(self):
+        idx = self.stack.currentIndex()
+        if idx == 0:
+            if not self.file_path:
+                QMessageBox.warning(self, "No file", "Please select a file first.")
+                return
+            self.populate_mapping_controls()
+            self.stack.setCurrentIndex(1)
+        elif idx == 1:
+            if not self.validate_mapping():
+                return
+            self.build_preview()
+            self.stack.setCurrentIndex(2)
+        self._update_nav()
+
+    # ---------- Step 1
+    def choose_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select File", "", "Data Files (*.csv *.xls *.xlsx);;All Files (*)")
+        if not path: return
+        self.file_path = path
+        self.file_ext = os.path.splitext(path)[1].lower().lstrip(".")
+        self.path_edit.setText(self.file_path)
+
+        try:
+            if self.file_ext == "csv":
+                self.raw_df = pd.read_csv(self.file_path, dtype=str, keep_default_na=False)
+            elif self.file_ext in ("xls", "xlsx"):
+                self.raw_df = pd.read_excel(self.file_path, dtype=str, keep_default_na=False, engine=None)
+            else:
+                QMessageBox.warning(self, "Unsupported", f"Unsupported file type: .{self.file_ext}")
+                self.raw_df = None; return
+        except Exception as e:
+            QMessageBox.critical(self, "Load error", f"Could not read the file:\n{e}")
+            self.raw_df = None; return
+
+        if self.raw_df is None or self.raw_df.empty:
+            self.detect_label.setText("<span style='color:orange'>File is empty or unreadable.</span>"); return
+
+        self.headers = list(self.raw_df.columns)
+        prof = match_profile(self.headers, self.file_ext, self.profiles)
+        if prof:
+            self.mapping = prof.get("mapping", {})
+            cleaners = prof.get("cleaners", {})
+            self.mapping["strip_currency"] = cleaners.get("strip_currency", True)
+            self.mapping["paren_negative"] = cleaners.get("paren_negative", True)
+            self.mapping["thousands_sep"] = cleaners.get("thousands_sep", True)
+            self.mapping["invert_amount"] = cleaners.get("invert_amount", False)
+            self.detect_label.setText(f"Matched profile: <b>{prof.get('name','(unnamed)')}</b>")
+        else:
+            self.mapping = guess_mapping(self.headers)
+            self.detect_label.setText("No profile matched. Mapping guessed — please review.")
+
+    # ---------- Step 2
+    def populate_mapping_controls(self):
+        if self.raw_df is None: return
+        cols = [""] + normalize_headers(self.headers)
+
+        def fill(combo, pre):
+            combo.clear(); combo.addItems(cols)
+            if pre and pre in cols: combo.setCurrentText(pre)
+
+        fill(self.map_date, self.mapping.get("date",""))
+        fill(self.map_vendor, self.mapping.get("vendor",""))
+        fill(self.map_amount, self.mapping.get("amount",""))
+        fill(self.map_debit, self.mapping.get("debit",""))
+        fill(self.map_credit, self.mapping.get("credit",""))
+        fill(self.map_memo, self.mapping.get("memo",""))
+        fill(self.map_external_id, self.mapping.get("external_id",""))
+        fill(self.map_balance, self.mapping.get("balance",""))
+        fill(self.map_type, self.mapping.get("type",""))
+
+        amode = self.mapping.get("amount_mode","single_amount")
+        self.amount_mode.setCurrentText("Single Amount column" if amode == "single_amount" else "Debit/Credit columns")
+        self.on_amount_mode_changed(self.amount_mode.currentText())
+
+        fmt = self.mapping.get("date_format")
+        label = next((lab for lab, ff in DATE_FORMAT_CHOICES if ff == fmt), "Auto")
+        self.date_format.setCurrentText(label)
+
+        self.chk_strip_currency.setChecked(bool(self.mapping.get("strip_currency", True)))
+        self.chk_paren_negative.setChecked(bool(self.mapping.get("paren_negative", True)))
+        self.chk_thousands.setChecked(bool(self.mapping.get("thousands_sep", True)))
+        self.chk_invert.setChecked(bool(self.mapping.get("invert_amount", False)))
+
+        # account default
+        if self.app.accounts:
+            self.account_combo.setCurrentText(self.app.accounts[0]["name"])
+            self.account_choice = self.app.accounts[0]["name"]
+        else:
+            self.account_choice = "Unassigned"
+
+        # profile name suggestion
+        base = os.path.basename(self.file_path)
+        self.profile_name_edit.setText(os.path.splitext(base)[0])
+
+    def on_amount_mode_changed(self, txt):
+        is_single = txt.startswith("Single")
+        self.map_amount.setEnabled(is_single)
+        self.map_debit.setEnabled(not is_single)
+        self.map_credit.setEnabled(not is_single)
+
+    def on_account_changed(self, val):
+        if val == "➕ Add new account…":
+            from PySide6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(self, "New Account", "Account name:")
+            if ok and name.strip():
+                try:
+                    # create with zero starting balance; parent app persists
+                    self.app.accounts.append({"name": name.strip(), "balance": 0.0, "starting_balance": 0.0})
+                    self.app.save_json("accounts.json", self.app.accounts)
+                except Exception as e:
+                    QMessageBox.critical(self, "Account", f"Could not create account:\n{e}")
+                self.account_combo.clear()
+                self.account_combo.addItems([a["name"] for a in self.app.accounts] + ["➕ Add new account…"])
+                self.account_combo.setCurrentText(name.strip())
+                self.account_choice = name.strip()
+            else:
+                if self.app.accounts:
+                    self.account_combo.setCurrentText(self.app.accounts[0]["name"])
+                    self.account_choice = self.app.accounts[0]["name"]
+                else:
+                    self.account_choice = "Unassigned"
+        else:
+            self.account_choice = val
+
+    def validate_mapping(self):
+        if not self.map_date.currentText().strip() or not self.map_vendor.currentText().strip():
+            QMessageBox.warning(self, "Mapping", "Please select Date and Vendor columns."); return False
+        if self.amount_mode.currentText().startswith("Single"):
+            if not self.map_amount.currentText().strip():
+                QMessageBox.warning(self, "Mapping", "Please select the Amount column."); return False
+        else:
+            if not (self.map_debit.currentText().strip() or self.map_credit.currentText().strip()):
+                QMessageBox.warning(self, "Mapping", "Select at least one of Debit or Credit columns."); return False
+        return True
+
+    # ---------- Step 3
+    def build_preview(self):
+        # collect mapping
+        self.mapping["date"] = self.map_date.currentText().strip()
+        self.mapping["vendor"] = self.map_vendor.currentText().strip()
+        self.mapping["amount_mode"] = "single_amount" if self.amount_mode.currentText().startswith("Single") else "debit_credit"
+        self.mapping["amount"] = self.map_amount.currentText().strip()
+        self.mapping["debit"] = self.map_debit.currentText().strip()
+        self.mapping["credit"] = self.map_credit.currentText().strip()
+        self.mapping["memo"] = self.map_memo.currentText().strip()
+        self.mapping["external_id"] = self.map_external_id.currentText().strip()
+        self.mapping["balance"] = self.map_balance.currentText().strip()
+        self.mapping["type"] = self.map_type.currentText().strip()
+        label = self.date_format.currentText()
+        self.mapping["date_format"] = next((ff for lab, ff in DATE_FORMAT_CHOICES if lab == label), None)
+        self.mapping["strip_currency"] = self.chk_strip_currency.isChecked()
+        self.mapping["paren_negative"] = self.chk_paren_negative.isChecked()
+        self.mapping["thousands_sep"] = self.chk_thousands.isChecked()
+        self.mapping["invert_amount"] = self.chk_invert.isChecked()
+
+        df = self.raw_df.copy()
+        existing_keys = set()
+        if not self.app.df.empty:
+            for _, ex in self.app.df.iterrows():
+                try:
+                    amt = f"{float(ex.get('Amount',0.0)):.2f}"
+                except Exception:
+                    amt = "0.00"
+                key = f"{ex.get('Date','')}|{str(ex.get('Vendor') or '').lower().strip()}|{amt}|{ex.get('Account') or ''}"
+                existing_keys.add(key)
+
+        self.preview_rows = []; self.preview_flags = []; seen = set()
+        opts = dict(
+            strip_currency=self.mapping["strip_currency"],
+            paren_negative=self.mapping["paren_negative"],
+            thousands_sep=self.mapping["thousands_sep"],
+            invert=self.mapping["invert_amount"]
+        )
+
+        for _, row in df.iterrows():
+            date_val = parse_date_value(row.get(self.mapping["date"]), self.mapping["date_format"])
+            vendor = clean_vendor(row.get(self.mapping["vendor"]))
+            if self.mapping["amount_mode"] == "single_amount":
+                amount = parse_amount_value(row.get(self.mapping["amount"]), **opts)
+            else:
+                amount = compute_amount_from_dc(row.get(self.mapping["debit"]), row.get(self.mapping["credit"]), **opts)
+
+            norm = {
+                "Date": date_val.strftime("%Y-%m-%d") if date_val else "",
+                "Vendor": vendor,
+                "Amount": amount if amount is not None else "",
+                "Memo": (row.get(self.mapping["memo"]) if self.mapping["memo"] else "") or "",
+                "ExternalId": (row.get(self.mapping["external_id"]) if self.mapping["external_id"] else "") or "",
+                "Account": self.account_choice or "Unassigned"
+            }
+
+            valid = True; err = ""
+            if not norm["Date"]: valid = False; err = "Bad date"
+            if norm["Amount"] in ["", None]:
+                valid = False; err = (err + ", " if err else "") + "Bad amount"
+
+            key = dup_key(norm)
+            is_dup = key in existing_keys or key in seen
+            if not is_dup: seen.add(key)
+
+            self.preview_rows.append(norm)
+            self.preview_flags.append({"valid": valid, "duplicate": is_dup, "error": err})
+
+        cols = ["Date", "Vendor", "Amount", "Account", "Duplicate?", "Valid?", "Error", "ExternalId", "Memo"]
+        self.preview_table.setColumnCount(len(cols))
+        self.preview_table.setHorizontalHeaderLabels(cols)
+        self.preview_table.setRowCount(len(self.preview_rows))
+
+        dup_cnt = inv_cnt = 0
+        for r, row in enumerate(self.preview_rows):
+            flags = self.preview_flags[r]
+            self.preview_table.setItem(r, 0, QTableWidgetItem(row["Date"]))
+            self.preview_table.setItem(r, 1, QTableWidgetItem(row["Vendor"]))
+            amt_item = QTableWidgetItem("" if row["Amount"] in ["", None] else f"${float(row['Amount']):,.2f}")
+            amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.preview_table.setItem(r, 2, amt_item)
+            self.preview_table.setItem(r, 3, QTableWidgetItem(row["Account"]))
+            self.preview_table.setItem(r, 4, QTableWidgetItem("Yes" if flags["duplicate"] else "No"))
+            self.preview_table.setItem(r, 5, QTableWidgetItem("Yes" if flags["valid"] else "No"))
+            self.preview_table.setItem(r, 6, QTableWidgetItem(flags["error"]))
+            self.preview_table.setItem(r, 7, QTableWidgetItem(row["ExternalId"]))
+            self.preview_table.setItem(r, 8, QTableWidgetItem(row["Memo"]))
+
+            if flags["duplicate"]:
+                dup_cnt += 1
+                for c in range(self.preview_table.columnCount()):
+                    it = self.preview_table.item(r, c)
+                    if it: it.setBackground(Qt.darkYellow)
+            if not flags["valid"]:
+                inv_cnt += 1
+                for c in range(self.preview_table.columnCount()):
+                    it = self.preview_table.item(r, c)
+                    if it:
+                        it.setBackground(Qt.darkRed); it.setForeground(Qt.white)
+
+        self.preview_table.resizeColumnsToContents()
+        ok = len(self.preview_rows) - dup_cnt - inv_cnt
+        self.preview_info.setText(f"Rows: {len(self.preview_rows)}  |  Valid (non-dup): {ok}  |  Duplicates: {dup_cnt}  |  Invalid: {inv_cnt}")
+
+    # ---------- Commit
+    def on_commit(self):
+        if not self.preview_rows:
+            QMessageBox.information(self, "Import", "No rows to import."); return
+        rows = []
+        for i, row in enumerate(self.preview_rows):
+            f = self.preview_flags[i]
+            if f["valid"] and not f["duplicate"]:
+                rows.append(row)
+        if not rows:
+            QMessageBox.information(self, "Import", "All rows are invalid or duplicates. Nothing to import.")
+            return
+
+        # Backup transactions csv before write
+        try:
+            tx_path = "sample_transactions.csv"
+            if os.path.exists(tx_path):
+                stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                shutil.copy(tx_path, f"sample_transactions.backup-{stamp}.csv")
+        except Exception as e:
+            QMessageBox.warning(self, "Backup", f"Backup failed (continuing):\n{e}")
+
+        # Append to parent df
+        appended = 0
+        for r in rows:
+            try:
+                new_id = self.app._next_tx_id()
+                self.app.df.loc[len(self.app.df)] = {
+                    "Id": int(new_id),
+                    "Date": r["Date"],
+                    "Vendor": r["Vendor"],
+                    "Amount": float(r["Amount"]),
+                    "Type": "Expense" if float(r["Amount"]) < 0 else "Income",
+                    "Category": "Uncategorized",
+                    "Account": r.get("Account") or "Unassigned",
+                    "AppliedToBalance": "False"
+                }
+                appended += 1
+            except Exception:
+                pass
+
+        # Save & refresh
+        self.app.save_transactions()
+        self.app.refresh_all()
+
+        # Save profile (optional)
+        if self.chk_remember.isChecked():
+            name = self.profile_name_edit.text().strip() or "Unnamed profile"
+            prof = {
+                "name": name,
+                "fingerprint": {"headers": lower_headers(self.headers), "ext": self.file_ext},
+                "mapping": {
+                    "date": self.mapping.get("date",""),
+                    "vendor": self.mapping.get("vendor",""),
+                    "amount_mode": self.mapping.get("amount_mode","single_amount"),
+                    "amount": self.mapping.get("amount",""),
+                    "debit": self.mapping.get("debit",""),
+                    "credit": self.mapping.get("credit",""),
+                    "memo": self.mapping.get("memo",""),
+                    "external_id": self.mapping.get("external_id",""),
+                    "balance": self.mapping.get("balance",""),
+                    "type": self.mapping.get("type",""),
+                    "date_format": self.mapping.get("date_format", None)
+                },
+                "cleaners": {
+                    "strip_currency": self.mapping.get("strip_currency", True),
+                    "paren_negative": self.mapping.get("paren_negative", True),
+                    "thousands_sep": self.mapping.get("thousands_sep", True),
+                    "invert_amount": self.mapping.get("invert_amount", False)
+                }
+            }
+            profiles = load_profiles()
+            # overwrite by name if exists
+            for i, p in enumerate(profiles):
+                if p.get("name","") == name:
+                    profiles[i] = prof; break
+            else:
+                profiles.append(prof)
+            save_profiles(profiles)
+
+        QMessageBox.information(self, "Import complete", f"Imported {appended} transaction(s).")
+        self.accept()
