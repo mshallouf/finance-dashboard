@@ -8,9 +8,14 @@ from datetime import datetime as dt
 from PySide6.QtWidgets import (
     QApplication, QWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QLabel, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QMessageBox, QMenu,
-    QTabWidget, QHBoxLayout, QComboBox, QDateEdit, QGroupBox, QGridLayout
+    QTabWidget, QHBoxLayout, QComboBox, QDateEdit, QGroupBox, QGridLayout,
+    QProgressBar
 )
 from PySide6.QtCore import Qt, QDate
+
+# Matplotlib (for Reports & Dashboard charts)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 # ----------------------------
 # File paths / constants
@@ -19,6 +24,16 @@ TRANSACTIONS_FILE = "sample_transactions.csv"
 BUDGET_FILE = "budgets.json"
 ACCOUNTS_FILE = "accounts.json"
 SETTINGS_FILE = "settings.json"
+CATEGORIES_FILE = "categories.json"
+
+UNCATEGORIZED = "Uncategorized"
+NEW_CATEGORY_OPTION = "➕ New category…"
+
+# Dark theme colors
+DARK_FIG = "#121212"
+DARK_AX = "#121212"
+LIGHT_TEXT = "#FFFFFF"
+GRID_COLOR = "#2a2a2a"
 
 
 # ----------------------------
@@ -31,9 +46,6 @@ def end_of_month(date: datetime.date) -> datetime.date:
     next_month = date.replace(day=28) + datetime.timedelta(days=4)
     return next_month - datetime.timedelta(days=next_month.day)
 
-def days_in_month(date: datetime.date) -> int:
-    return (end_of_month(date) - start_of_month(date)).days + 1
-
 def fmt_money(value) -> str:
     if value is None or value == "":
         return ""
@@ -44,16 +56,91 @@ def fmt_money(value) -> str:
 
 
 # ----------------------------
+# Matplotlib canvas (dark theme)
+# ----------------------------
+class MplCanvas(FigureCanvas):
+    def __init__(self, width=4, height=3, dpi=100):
+        fig = Figure(figsize=(width, height), dpi=dpi, tight_layout=True)
+        fig.set_facecolor(DARK_FIG)
+        self.ax = fig.add_subplot(111)
+        self.ax.set_facecolor(DARK_AX)
+        self.ax.tick_params(colors=LIGHT_TEXT)
+        self.ax.xaxis.label.set_color(LIGHT_TEXT)
+        self.ax.yaxis.label.set_color(LIGHT_TEXT)
+        self.ax.title.set_color(LIGHT_TEXT)
+        super().__init__(fig)
+
+    def set_dark(self):
+        self.figure.set_facecolor(DARK_FIG)
+        self.ax.set_facecolor(DARK_AX)
+        self.ax.tick_params(colors=LIGHT_TEXT)
+        self.ax.xaxis.label.set_color(LIGHT_TEXT)
+        self.ax.yaxis.label.set_color(LIGHT_TEXT)
+        self.ax.title.set_color(LIGHT_TEXT)
+
+
+# ----------------------------
 # Dialogs
 # ----------------------------
+class CategoryDialog(QDialog):
+    """Add/Edit Category (name + type)."""
+    def __init__(self, category=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Category" if category is None else "Edit Category")
+        self.layout = QFormLayout(self)
+
+        self.name_input = QLineEdit(self)
+        self.type_dropdown = QComboBox(self)
+        self.type_dropdown.addItems(["Expense", "Income"])
+
+        self.layout.addRow("Category Name:", self.name_input)
+        self.layout.addRow("Type:", self.type_dropdown)
+
+        if category:
+            self.name_input.setText(str(category["name"]))
+            self.type_dropdown.setCurrentText(str(category["type"]).capitalize())
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.layout.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    def getData(self):
+        return {
+            "name": self.name_input.text().strip(),
+            "type": self.type_dropdown.currentText()
+        }
+
+
+class ReassignDialog(QDialog):
+    """Prompt to reassign a category to another one on delete."""
+    def __init__(self, old_category, choices, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Reassign '{old_category}' to...")
+        self.layout = QFormLayout(self)
+
+        self.choice = QComboBox(self)
+        self.choice.addItems(sorted(choices))
+        self.layout.addRow("Move to Category:", self.choice)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.layout.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    def getSelection(self):
+        return self.choice.currentText()
+
+
 class AddTransactionDialog(QDialog):
     """
     Add/Edit Transaction.
-    - Date uses QDateEdit (calendar)
-    - Type (Expense/Income)
-    - Account dropdown
+    - Date: QDateEdit (calendar)
+    - Type: Expense/Income
+    - Category: dropdown from list + "New category…" to add on the fly
+    - Account: dropdown
     """
-    def __init__(self, parent=None, transaction=None, account_names=None):
+    def __init__(self, parent=None, transaction=None, account_names=None, category_names=None):
         super().__init__(parent)
         self.setWindowTitle("Add Transaction" if transaction is None else "Edit Transaction")
         self.layout = QFormLayout(self)
@@ -68,8 +155,18 @@ class AddTransactionDialog(QDialog):
         self.type_dropdown = QComboBox(self)
         self.type_dropdown.addItems(["Expense", "Income"])
 
-        self.category_input = QLineEdit(self)
+        # Category dropdown (managed list + new)
+        self.category_dropdown = QComboBox(self)
+        category_names = category_names or [UNCATEGORIZED]
+        names = list(category_names)
+        if UNCATEGORIZED not in names:
+            names = [UNCATEGORIZED] + names
+        if NEW_CATEGORY_OPTION not in names:
+            names = names + [NEW_CATEGORY_OPTION]
+        self.category_dropdown.addItems(sorted([n for n in names if n not in [NEW_CATEGORY_OPTION, UNCATEGORIZED]])
+                                       + [UNCATEGORIZED, NEW_CATEGORY_OPTION])
 
+        # Account dropdown
         self.account_dropdown = QComboBox(self)
         account_names = account_names or []
         if "Unassigned" not in account_names:
@@ -80,7 +177,7 @@ class AddTransactionDialog(QDialog):
         self.layout.addRow("Vendor:", self.vendor_input)
         self.layout.addRow("Amount:", self.amount_input)
         self.layout.addRow("Type:", self.type_dropdown)
-        self.layout.addRow("Category:", self.category_input)
+        self.layout.addRow("Category:", self.category_dropdown)
         self.layout.addRow("Account:", self.account_dropdown)
 
         # Prefill if editing
@@ -92,25 +189,79 @@ class AddTransactionDialog(QDialog):
             self.date_input.setDate(QDate(d.year, d.month, d.day))
             self.vendor_input.setText(str(transaction["Vendor"]))
             self.amount_input.setText(str(transaction["Amount"]))
-            self.category_input.setText(str(transaction["Category"]))
-            # Type by sign (or provided)
             t = transaction.get("Type", "Expense")
             if t not in ["Expense", "Income"]:
                 t = "Expense" if float(transaction.get("Amount", 0)) < 0 else "Income"
             self.type_dropdown.setCurrentText(t)
+            # Category
+            cat = str(transaction.get("Category", UNCATEGORIZED)) or UNCATEGORIZED
+            idxc = self.category_dropdown.findText(cat)
+            if idxc >= 0:
+                self.category_dropdown.setCurrentIndex(idxc)
             # Account
             acct = str(transaction.get("Account", "Unassigned")) or "Unassigned"
-            idx = self.account_dropdown.findText(acct)
-            if idx >= 0:
-                self.account_dropdown.setCurrentIndex(idx)
+            idxa = self.account_dropdown.findText(acct)
+            if idxa >= 0:
+                self.account_dropdown.setCurrentIndex(idxa)
         else:
             today = datetime.date.today()
             self.date_input.setDate(QDate(today.year, today.month, today.day))
+
+        # Hook "New category…" behavior
+        self.category_dropdown.currentTextChanged.connect(self._maybe_add_new_category)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         self.layout.addWidget(self.buttons)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+
+    def _maybe_add_new_category(self, text):
+        if text == NEW_CATEGORY_OPTION:
+            # Launch create-category dialog
+            dlg = CategoryDialog(parent=self)
+            if dlg.exec() == QDialog.Accepted:
+                data = dlg.getData()
+                name = data["name"]
+                ctype = data["type"]
+                if not name:
+                    QMessageBox.warning(self, "Input Error", "Category name cannot be empty.")
+                    # reset selection
+                    self._reset_category_selection()
+                    return
+                # Ask parent (FinanceApp) to persist and refresh master list
+                app = self.parent()
+                if hasattr(app, "add_category_programmatically"):
+                    ok = app.add_category_programmatically(name, ctype)
+                    if not ok:
+                        QMessageBox.warning(self, "Exists", f"Category '{name}' already exists.")
+                        self._reset_category_selection()
+                        return
+                    # Refresh dropdown options (append before special items)
+                    items = [self.category_dropdown.itemText(i) for i in range(self.category_dropdown.count())]
+                    base = [it for it in items if it not in [NEW_CATEGORY_OPTION]]
+                    if name not in base:
+                        base.insert(0, name)
+                    # rebuild list: sorted (except keep special items order)
+                    base = sorted([b for b in base if b not in [UNCATEGORIZED, NEW_CATEGORY_OPTION]])
+                    self.category_dropdown.clear()
+                    for b in base:
+                        self.category_dropdown.addItem(b)
+                    self.category_dropdown.addItem(UNCATEGORIZED)
+                    self.category_dropdown.addItem(NEW_CATEGORY_OPTION)
+                    # select new category
+                    idx = self.category_dropdown.findText(name)
+                    if idx >= 0:
+                        self.category_dropdown.setCurrentIndex(idx)
+                else:
+                    self._reset_category_selection()
+            else:
+                self._reset_category_selection()
+
+    def _reset_category_selection(self):
+        # pick UNCATEGORIZED as safe default
+        idx = self.category_dropdown.findText(UNCATEGORIZED)
+        if idx >= 0:
+            self.category_dropdown.setCurrentIndex(idx)
 
     def getData(self):
         date_py = self.date_input.date().toPython()
@@ -119,7 +270,7 @@ class AddTransactionDialog(QDialog):
             "Vendor": self.vendor_input.text(),
             "Amount": self.amount_input.text(),
             "Type": self.type_dropdown.currentText(),
-            "Category": self.category_input.text(),
+            "Category": self.category_dropdown.currentText(),
             "Account": self.account_dropdown.currentText()
         }
 
@@ -128,16 +279,19 @@ class BudgetDialog(QDialog):
     """
     Add/Edit a budget for a category.
     Period: Monthly/Weekly/Daily
+    Only Expense categories are shown.
     """
-    def __init__(self, categories, budgets, parent=None):
+    def __init__(self, categories_expense, budgets, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Set/Edit Budget")
         self.budgets = budgets  # {cat: {"amount": float, "period": "daily|weekly|monthly"}}
-
         self.layout = QFormLayout(self)
 
         self.category_dropdown = QComboBox(self)
-        self.category_dropdown.addItems(categories)
+        cats = categories_expense or [UNCATEGORIZED]
+        if UNCATEGORIZED not in cats:
+            cats = [UNCATEGORIZED] + list(cats)
+        self.category_dropdown.addItems(sorted(cats))
         self.layout.addRow("Category:", self.category_dropdown)
 
         self.amount_input = QLineEdit(self)
@@ -212,14 +366,20 @@ class FinanceApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("My Finance Tool")
-        self.setGeometry(80, 80, 1150, 780)
+        self.setGeometry(80, 80, 1300, 900)
         self.layout = QVBoxLayout(self)
 
         # ------- Load Data -------
         self.df = self.load_transactions()
         self.budgets = self.migrate_budgets(self.load_json(BUDGET_FILE, default={}))
-        self.accounts = self.load_json(ACCOUNTS_FILE, default=[])
+        self.accounts = self.ensure_accounts_fields(self.load_json(ACCOUNTS_FILE, default=[]))
         self.settings = self.load_json(SETTINGS_FILE, default={"today_override": None})
+        self.categories = self.ensure_categories(self.load_json(CATEGORIES_FILE, default=[]))
+
+        # Dashboard local filter state
+        self.dashboard_filter_mode = "This Month"
+        self.dashboard_from_date = None
+        self.dashboard_to_date = None
 
         # ------- Tabs (Dashboard first) -------
         self.tabs = QTabWidget()
@@ -245,6 +405,16 @@ class FinanceApp(QWidget):
         self.tabs.addTab(self.accounts_tab, "Accounts")
         self.init_accounts_tab()
 
+        # Categories
+        self.categories_tab = QWidget()
+        self.tabs.addTab(self.categories_tab, "Categories")
+        self.init_categories_tab()
+
+        # Reports
+        self.reports_tab = QWidget()
+        self.tabs.addTab(self.reports_tab, "Reports")
+        self.init_reports_tab()
+
         # Settings
         self.settings_tab = QWidget()
         self.tabs.addTab(self.settings_tab, "Settings")
@@ -266,6 +436,50 @@ class FinanceApp(QWidget):
         with open(filename, "w") as f:
             json.dump(data, f, indent=2)
 
+    def ensure_categories(self, raw_list):
+        """
+        Normalize categories to list of {"name": str, "type": "Expense|Income"}.
+        Ensure 'Uncategorized' exists (Expense).
+        """
+        norm = []
+        seen = set()
+        if isinstance(raw_list, list):
+            for it in raw_list:
+                if isinstance(it, dict) and "name" in it:
+                    name = str(it["name"]).strip()
+                    if not name:
+                        continue
+                    ctype = str(it.get("type", "Expense")).capitalize()
+                    if ctype not in ["Expense", "Income"]:
+                        ctype = "Expense"
+                    key = name.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    norm.append({"name": name, "type": ctype})
+        # Ensure UNCATEGORIZED
+        if UNCATEGORIZED.lower() not in [c["name"].lower() for c in norm]:
+            norm.insert(0, {"name": UNCATEGORIZED, "type": "Expense"})
+        # Save normalized if changed
+        if norm != raw_list:
+            self.save_json(CATEGORIES_FILE, norm)
+        return norm
+
+    def get_category_names(self):
+        return [c["name"] for c in self.categories]
+
+    def get_category_names_by_type(self, ctype):
+        return [c["name"] for c in self.categories if c["type"].lower() == ctype.lower()]
+
+    def add_category_programmatically(self, name: str, ctype: str) -> bool:
+        """Add category from transaction dialog; return False if exists."""
+        if name.lower() in [c["name"].lower() for c in self.categories]:
+            return False
+        self.categories.append({"name": name, "type": ctype})
+        self.save_json(CATEGORIES_FILE, self.categories)
+        self.update_categories_table()
+        return True
+
     def migrate_budgets(self, raw):
         """Normalize budgets to dict with amount+period."""
         migrated = {}
@@ -284,8 +498,35 @@ class FinanceApp(QWidget):
             self.save_json(BUDGET_FILE, migrated)
         return migrated
 
+    def ensure_accounts_fields(self, raw):
+        """
+        Ensure each account has name, balance (float), and starting_balance (float).
+        If starting_balance missing, set starting_balance = balance.
+        """
+        if not isinstance(raw, list):
+            return []
+        changed = False
+        for acct in raw:
+            if "balance" in acct:
+                try:
+                    acct["balance"] = float(acct["balance"])
+                except Exception:
+                    acct["balance"] = 0.0
+            else:
+                acct["balance"] = 0.0
+                changed = True
+            if "name" not in acct:
+                acct["name"] = "Unnamed"
+                changed = True
+            if "starting_balance" not in acct:
+                acct["starting_balance"] = acct["balance"]
+                changed = True
+        if changed:
+            self.save_json(ACCOUNTS_FILE, raw)
+        return raw
+
     def load_transactions(self) -> pd.DataFrame:
-        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account']
+        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']
         try:
             df = pd.read_csv(TRANSACTIONS_FILE, dtype=str)
         except FileNotFoundError:
@@ -296,17 +537,21 @@ class FinanceApp(QWidget):
             if c not in df.columns:
                 if c == 'Id':
                     continue
-                df[c] = "" if c not in ['Amount'] else "0"
+                if c == 'AppliedToBalance':
+                    df[c] = "False"
+                elif c == 'Amount':
+                    df[c] = "0"
+                else:
+                    df[c] = ""
         # Id column
         if "Id" not in df.columns or df["Id"].isna().all():
-            # assign incremental Ids
             df["Id"] = ""
             next_id = 1
             for i in df.index:
                 df.at[i, "Id"] = str(next_id)
                 next_id += 1
 
-        # Dtypes
+        # Dtypes and defaults
         if not df.empty:
             df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
             # Type inference if missing
@@ -319,20 +564,28 @@ class FinanceApp(QWidget):
                 df['Account'] = df['Account'].replace("", "Unassigned")
             else:
                 df['Account'] = "Unassigned"
+            # Category default
+            if "Category" in df.columns:
+                df['Category'] = df['Category'].replace("", UNCATEGORIZED)
+            else:
+                df['Category'] = UNCATEGORIZED
+            # AppliedToBalance -> bool
+            df['AppliedToBalance'] = df['AppliedToBalance'].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
         else:
             df = pd.DataFrame(columns=cols)
 
-        # Reorder columns
-        df = df[['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account']]
+        df = df[['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']]
         return df
 
     def save_transactions(self):
-        # Ensure proper order
-        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account']
+        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']
         for c in cols:
             if c not in self.df.columns:
                 self.df[c] = ""
-        self.df[cols].to_csv(TRANSACTIONS_FILE, index=False)
+        # Cast AppliedToBalance to string for CSV
+        df_out = self.df.copy()
+        df_out['AppliedToBalance'] = df_out['AppliedToBalance'].map(lambda x: "True" if bool(x) else "False")
+        df_out[cols].to_csv(TRANSACTIONS_FILE, index=False)
 
     def get_today(self) -> datetime.date:
         ov = self.settings.get("today_override")
@@ -346,7 +599,7 @@ class FinanceApp(QWidget):
     # ---------------- Budget math ----------------
     def monthly_equivalent(self, amount: float, period: str, today: datetime.date) -> float:
         period = (period or "monthly").lower()
-        dim = days_in_month(today)
+        dim = (end_of_month(today) - start_of_month(today)).days + 1
         if period == "monthly":
             return float(amount)
         elif period == "weekly":
@@ -473,12 +726,13 @@ class FinanceApp(QWidget):
         today = self.get_today()
         if mode == "This Month":
             start = start_of_month(today)
-            end = end_of_month(today)
+            # inclusive end = today for Tx view
+            end = today
         elif mode == "Last Month":
             first_this_month = start_of_month(today)
             last_month_end = first_this_month - datetime.timedelta(days=1)
             start = start_of_month(last_month_end)
-            end = end_of_month(last_month_end)
+            end = last_month_end
         elif mode == "Last 30 Days":
             end = today
             start = today - datetime.timedelta(days=29)
@@ -487,11 +741,12 @@ class FinanceApp(QWidget):
             start = today - datetime.timedelta(days=6)
         elif mode == "This Year":
             start = today.replace(month=1, day=1)
-            end = today.replace(month=12, day=31)
+            end = today
         elif mode == "Custom Range":
             start = self.txn_filter_from_picker.date().toPython()
             end = self.txn_filter_to_picker.date().toPython()
         else:
+            # default: full span
             if self.df.empty:
                 start = today
                 end = today
@@ -546,7 +801,6 @@ class FinanceApp(QWidget):
         filtered_df = self.get_filtered_transactions()
         sorted_df = self.sort_transactions_df(filtered_df)
 
-        # Display: Id, Date, Vendor, Amount, Type, Category, Account
         display_df = sorted_df.copy()
         if not display_df.empty:
             display_df['Date'] = pd.to_datetime(display_df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
@@ -566,9 +820,9 @@ class FinanceApp(QWidget):
                     item = QTableWidgetItem(str(val))
                 self.table.setItem(r, c, item)
 
-        # Hide Id from view but keep it in the model for selection mapping
-        id_col = list(display_df.columns).index("Id") if "Id" in display_df.columns else -1
-        if id_col >= 0:
+        # Hide Id column
+        if "Id" in display_df.columns:
+            id_col = list(display_df.columns).index("Id")
             self.table.setColumnHidden(id_col, True)
 
         self.table.resizeColumnsToContents()
@@ -592,14 +846,17 @@ class FinanceApp(QWidget):
             m = self.df['Id'].astype(int).max()
             return str(m + 1)
         except Exception:
-            # fallback: use row count + 1
             return str(len(self.df) + 1)
 
     def _account_names(self):
         return [a["name"] for a in self.accounts] if self.accounts else ["Unassigned"]
 
     def add_transaction(self):
-        dialog = AddTransactionDialog(self, account_names=self._account_names())
+        dialog = AddTransactionDialog(
+            self,
+            account_names=self._account_names(),
+            category_names=self.get_category_names()
+        )
         while True:
             result = dialog.exec()
             if result == QDialog.Rejected:
@@ -615,15 +872,16 @@ class FinanceApp(QWidget):
             amount = -abs(amount) if t == "Expense" else abs(amount)
             new["Amount"] = amount
 
-            if not (new["Vendor"].strip() and new["Category"].strip()):
-                QMessageBox.warning(self, "Input Error", "Vendor and Category cannot be empty.")
+            if not new["Vendor"].strip():
+                QMessageBox.warning(self, "Input Error", "Vendor cannot be empty.")
                 continue
-            new["Category"] = new["Category"].strip().lower().capitalize()
+            if new["Category"] not in self.get_category_names():
+                QMessageBox.warning(self, "Input Error", "Category must be chosen from the Categories tab or created via 'New category…'.")
+                continue
             if not new.get("Account"):
                 new["Account"] = "Unassigned"
             break
 
-        # Assign Id
         new_row = {
             "Id": self._next_tx_id(),
             "Date": new["Date"],
@@ -631,7 +889,8 @@ class FinanceApp(QWidget):
             "Amount": new["Amount"],
             "Type": new["Type"],
             "Category": new["Category"],
-            "Account": new["Account"]
+            "Account": new["Account"],
+            "AppliedToBalance": False
         }
         self.df.loc[len(self.df)] = new_row
         self.save_and_refresh()
@@ -640,13 +899,11 @@ class FinanceApp(QWidget):
         row = self.table.currentRow()
         if row < 0:
             return None
-        # The table model has hidden Id column; find it and read value
         for c in range(self.table.columnCount()):
             header = self.table.horizontalHeaderItem(c).text()
             if header == "Id":
                 item = self.table.item(row, c)
                 return item.text() if item else None
-        # fallback: try to compute from filtered view
         filtered_df = self.sort_transactions_df(self.get_filtered_transactions())
         if row < len(filtered_df) and "Id" in filtered_df.columns:
             return str(filtered_df.iloc[row]["Id"])
@@ -674,7 +931,6 @@ class FinanceApp(QWidget):
         a_edit = menu.addAction("Edit Transaction")
         a_del = menu.addAction("Delete Transaction")
         action = menu.exec(self.table.mapToGlobal(pos))
-        # map selected row to Id
         row_id = self._selected_row_id()
         if action == a_edit and row_id:
             self._edit_transaction_by_id(row_id)
@@ -689,7 +945,12 @@ class FinanceApp(QWidget):
         i = int(matches[0])
         current_data = self.df.loc[i].to_dict()
 
-        dialog = AddTransactionDialog(self, transaction=current_data, account_names=self._account_names())
+        dialog = AddTransactionDialog(
+            self,
+            transaction=current_data,
+            account_names=self._account_names(),
+            category_names=self.get_category_names()
+        )
         while True:
             result = dialog.exec()
             if result == QDialog.Rejected:
@@ -702,20 +963,21 @@ class FinanceApp(QWidget):
                 continue
             t = new.get("Type", "Expense")
             amount = -abs(amount) if t == "Expense" else abs(amount)
-            if not (new["Vendor"].strip() and new["Category"].strip()):
-                QMessageBox.warning(self, "Input Error", "Vendor and Category cannot be empty.")
+            if not new["Vendor"].strip():
+                QMessageBox.warning(self, "Input Error", "Vendor cannot be empty.")
                 continue
-            new_cat = new["Category"].strip().lower().capitalize()
-            acct = new.get("Account") or "Unassigned"
-            # Passed validation
+            if new["Category"] not in self.get_category_names():
+                QMessageBox.warning(self, "Input Error", "Category must be chosen from the Categories tab or created via 'New category…'.")
+                continue
             break
 
         self.df.at[i, 'Date'] = new['Date']
         self.df.at[i, 'Vendor'] = new['Vendor']
         self.df.at[i, 'Amount'] = amount
         self.df.at[i, 'Type'] = t
-        self.df.at[i, 'Category'] = new_cat
-        self.df.at[i, 'Account'] = acct
+        self.df.at[i, 'Category'] = new['Category']
+        self.df.at[i, 'Account'] = new['Account']
+        # Keep AppliedToBalance as-is for edited row
         self.save_and_refresh()
 
     def _delete_transaction_by_id(self, row_id: str):
@@ -734,9 +996,10 @@ class FinanceApp(QWidget):
         self.save_transactions()
         self.update_table()
         self.update_summary()
-        # Immediate refresh for other tabs so changes are visible right away
+        # Immediate refresh everywhere
         self.update_budgets_table()
         self.update_dashboard_tab()
+        self.refresh_reports()
 
     # ---------------- Budgets Tab ----------------
     def init_budgets_tab(self):
@@ -761,9 +1024,11 @@ class FinanceApp(QWidget):
         self.update_budgets_table()
 
     def _all_categories_for_budget(self):
-        txn_cats = set(self.df['Category'].astype(str).str.lower().str.capitalize()) if not self.df.empty else set()
-        budget_cats = set(self.budgets.keys())
-        return sorted(txn_cats | budget_cats)
+        # Only Expense categories make sense for budgets
+        cats = set(self.get_category_names_by_type("Expense"))
+        # Make sure any existing budget keys remain visible
+        cats |= set(self.budgets.keys())
+        return sorted(cats)
 
     def update_budgets_table(self):
         all_cats = self._all_categories_for_budget()
@@ -774,9 +1039,10 @@ class FinanceApp(QWidget):
             self.budget_table.setItem(r, 0, QTableWidgetItem(cat))
             bdata = self.budgets.get(cat)
             if isinstance(bdata, dict):
-                period = (bdata.get("period") or "monthly").capitalize()
+                period_code = (bdata.get("period") or "monthly").lower()
+                period = period_code.capitalize()
                 amount = bdata.get("amount", 0.0)
-                monthly_eq = self.monthly_equivalent(float(amount), bdata.get("period", "monthly"), today)
+                monthly_eq = self.monthly_equivalent(float(amount), period_code, today)
                 self.budget_table.setItem(r, 1, QTableWidgetItem(period))
                 amt_item = QTableWidgetItem(fmt_money(amount))
                 amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -792,15 +1058,12 @@ class FinanceApp(QWidget):
         self.budget_table.resizeColumnsToContents()
 
     def add_edit_budget(self):
-        all_cats = self._all_categories_for_budget()
-        dialog = BudgetDialog(all_cats, self.budgets, self)
+        cats_expense = self.get_category_names_by_type("Expense")
+        dialog = BudgetDialog(cats_expense, self.budgets, self)
         if dialog.exec() != QDialog.Accepted:
             return
         data = dialog.getData()
-        cat = data["Category"].strip()
-        if not cat:
-            QMessageBox.warning(self, "Input Error", "Please choose a category.")
-            return
+        cat = data["Category"].strip() or UNCATEGORIZED
         try:
             amt = float(data["Amount"])
         except ValueError:
@@ -842,14 +1105,21 @@ class FinanceApp(QWidget):
         btn_add = QPushButton("Add Account")
         btn_edit = QPushButton("Edit Account")
         btn_del = QPushButton("Delete Account")
+        btn_apply = QPushButton("Apply New Transactions")
+        btn_recalc = QPushButton("Recalculate Balances")
         row_btns.addWidget(btn_add)
         row_btns.addWidget(btn_edit)
         row_btns.addWidget(btn_del)
+        row_btns.addStretch()
+        row_btns.addWidget(btn_apply)
+        row_btns.addWidget(btn_recalc)
         layout.addLayout(row_btns)
 
         btn_add.clicked.connect(self.add_account)
         btn_edit.clicked.connect(self.edit_account)
         btn_del.clicked.connect(self.delete_account)
+        btn_apply.clicked.connect(self.apply_new_transactions_to_balances)
+        btn_recalc.clicked.connect(self.recalculate_balances_from_start)
 
         self.accounts_tab.setLayout(layout)
         self.update_accounts_table()
@@ -875,7 +1145,7 @@ class FinanceApp(QWidget):
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Balance must be a number.")
             return
-        self.accounts.append({"name": name, "balance": bal})
+        self.accounts.append({"name": name, "balance": bal, "starting_balance": bal})
         self.save_json(ACCOUNTS_FILE, self.accounts)
         self.update_accounts_table()
         self.update_dashboard_tab()
@@ -899,7 +1169,8 @@ class FinanceApp(QWidget):
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Balance must be a number.")
             return
-        self.accounts[row] = {"name": name, "balance": bal}
+        # If balance changed, we don't change starting_balance silently
+        self.accounts[row] = {"name": name, "balance": bal, "starting_balance": acct.get("starting_balance", bal)}
         self.save_json(ACCOUNTS_FILE, self.accounts)
         self.update_accounts_table()
         self.update_dashboard_tab()
@@ -917,27 +1188,275 @@ class FinanceApp(QWidget):
         self.update_accounts_table()
         self.update_dashboard_tab()
 
+    # ------- Balance Adjuster Logic -------
+    def apply_new_transactions_to_balances(self):
+        if not self.accounts:
+            QMessageBox.information(self, "No Accounts", "No accounts found. Add an account first.")
+            return
+        if self.df.empty:
+            QMessageBox.information(self, "No Transactions", "There are no transactions to apply.")
+            return
+
+        unapplied_mask = ~self.df['AppliedToBalance']
+        # Only count rows that match existing accounts (ignore Unassigned)
+        ac_names = {a["name"] for a in self.accounts}
+        acct_mask = self.df['Account'].isin(ac_names)
+        mask = unapplied_mask & acct_mask
+
+        if not mask.any():
+            QMessageBox.information(self, "Up to date", "All transactions are already applied to balances.")
+            return
+
+        # Sum by account and update balances
+        changed = 0
+        df_to_apply = self.df.loc[mask].copy()
+        if not df_to_apply.empty:
+            sums = df_to_apply.groupby('Account')['Amount'].sum()
+            for i, acct in enumerate(self.accounts):
+                inc = float(sums.get(acct["name"], 0.0))
+                if abs(inc) > 0.000001:
+                    self.accounts[i]["balance"] = float(self.accounts[i]["balance"]) + inc
+            changed = len(df_to_apply)
+
+        # Mark applied
+        self.df.loc[mask, 'AppliedToBalance'] = True
+
+        # Persist
+        self.save_json(ACCOUNTS_FILE, self.accounts)
+        self.save_transactions()
+        self.update_accounts_table()
+        self.update_dashboard_tab()
+
+        QMessageBox.information(self, "Balances Updated", f"Balances updated. {changed} transaction(s) applied.")
+
+    def recalculate_balances_from_start(self):
+        if not self.accounts:
+            QMessageBox.information(self, "No Accounts", "No accounts found.")
+            return
+
+        # Reset balances to starting
+        for i, acct in enumerate(self.accounts):
+            self.accounts[i]["balance"] = float(acct.get("starting_balance", acct.get("balance", 0.0)))
+
+        # Reapply all transactions that were previously applied
+        if not self.df.empty:
+            df_applied = self.df[self.df['AppliedToBalance']]
+            if not df_applied.empty:
+                sums = df_applied.groupby('Account')['Amount'].sum()
+                for i, acct in enumerate(self.accounts):
+                    inc = float(sums.get(acct["name"], 0.0))
+                    if abs(inc) > 0.000001:
+                        self.accounts[i]["balance"] = float(self.accounts[i]["balance"]) + inc
+
+        # Save + refresh
+        self.save_json(ACCOUNTS_FILE, self.accounts)
+        self.update_accounts_table()
+        self.update_dashboard_tab()
+
+        QMessageBox.information(self, "Recalculated", "Balances recalculated from starting balances.")
+
+    # ---------------- Categories Tab ----------------
+    def init_categories_tab(self):
+        layout = QVBoxLayout()
+
+        self.categories_table = QTableWidget()
+        self.categories_table.setColumnCount(2)
+        self.categories_table.setHorizontalHeaderLabels(["Category Name", "Type"])
+        layout.addWidget(self.categories_table)
+
+        btns = QHBoxLayout()
+        btn_add = QPushButton("Add Category")
+        btn_edit = QPushButton("Edit Category")
+        btn_del = QPushButton("Delete Category")
+        btns.addWidget(btn_add)
+        btns.addWidget(btn_edit)
+        btns.addWidget(btn_del)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        btn_add.clicked.connect(self.add_category)
+        btn_edit.clicked.connect(self.edit_category)
+        btn_del.clicked.connect(self.delete_category)
+
+        self.categories_tab.setLayout(layout)
+        self.update_categories_table()
+
+    def update_categories_table(self):
+        self.categories_table.setRowCount(len(self.categories))
+        for r, c in enumerate(sorted(self.categories, key=lambda x: x["name"].lower())):
+            self.categories_table.setItem(r, 0, QTableWidgetItem(c["name"]))
+            self.categories_table.setItem(r, 1, QTableWidgetItem(c["type"]))
+        self.categories_table.resizeColumnsToContents()
+
+    def add_category(self):
+        dialog = CategoryDialog(parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        data = dialog.getData()
+        name = data["name"]
+        if not name:
+            QMessageBox.warning(self, "Input Error", "Category name cannot be empty.")
+            return
+        if name.lower() in [c["name"].lower() for c in self.categories]:
+            QMessageBox.warning(self, "Exists", "A category with this name already exists.")
+            return
+        self.categories.append({"name": name, "type": data["type"]})
+        self.save_json(CATEGORIES_FILE, self.categories)
+        self.update_categories_table()
+
+    def edit_category(self):
+        row = self.categories_table.currentRow()
+        if row < 0 or row >= self.categories_table.rowCount():
+            QMessageBox.warning(self, "No Selection", "Select a category to edit.")
+            return
+        name = self.categories_table.item(row, 0).text()
+        orig = next((c for c in self.categories if c["name"] == name), None)
+        if not orig:
+            QMessageBox.warning(self, "Not Found", "Category not found.")
+            return
+        dialog = CategoryDialog(category=orig, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        data = dialog.getData()
+        new_name = data["name"]
+        new_type = data["type"]
+        if not new_name:
+            QMessageBox.warning(self, "Input Error", "Category name cannot be empty.")
+            return
+        # If name changed and collides
+        if new_name.lower() != orig["name"].lower() and new_name.lower() in [c["name"].lower() for c in self.categories]:
+            QMessageBox.warning(self, "Exists", "Another category with that name already exists.")
+            return
+
+        # Update references if renamed
+        old_name = orig["name"]
+        if new_name != old_name:
+            # Update transactions
+            if not self.df.empty:
+                self.df.loc[self.df['Category'] == old_name, 'Category'] = new_name
+                self.save_transactions()
+            # Update budgets
+            if old_name in self.budgets:
+                if new_name in self.budgets:
+                    # Keep destination's budget; drop old
+                    del self.budgets[old_name]
+                else:
+                    self.budgets[new_name] = self.budgets.pop(old_name)
+                self.save_json(BUDGET_FILE, self.budgets)
+
+        # Update category list
+        orig["name"] = new_name
+        orig["type"] = new_type
+        self.save_json(CATEGORIES_FILE, self.categories)
+        self.update_categories_table()
+        self.save_and_refresh()
+
+    def delete_category(self):
+        row = self.categories_table.currentRow()
+        if row < 0 or row >= self.categories_table.rowCount():
+            QMessageBox.warning(self, "No Selection", "Select a category to delete.")
+            return
+        cat = self.categories_table.item(row, 0).text()
+        if cat.lower() == UNCATEGORIZED.lower():
+            QMessageBox.warning(self, "Protected", "You cannot delete the Uncategorized category.")
+            return
+
+        # determine if in use
+        used = False
+        tx_count = 0
+        if not self.df.empty:
+            tx_count = int((self.df['Category'] == cat).sum())
+            used = used or tx_count > 0
+        bud_used = cat in self.budgets
+        used = used or bud_used
+
+        if used:
+            # choices: all other categories + UNCATEGORIZED
+            choices = [c["name"] for c in self.categories if c["name"] != cat]
+            if UNCATEGORIZED not in [x for x in choices]:
+                choices.append(UNCATEGORIZED)
+            dlg = ReassignDialog(cat, choices, parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            target = dlg.getSelection()
+            if target == cat:
+                QMessageBox.warning(self, "Invalid", "Reassignment target cannot be the same category.")
+                return
+
+            # Reassign transactions
+            if tx_count > 0:
+                self.df.loc[self.df['Category'] == cat, 'Category'] = target
+                self.save_transactions()
+            # Reassign budgets
+            if bud_used:
+                if target in self.budgets:
+                    # keep target budget; drop the deleted one
+                    del self.budgets[cat]
+                else:
+                    self.budgets[target] = self.budgets.pop(cat)
+                self.save_json(BUDGET_FILE, self.budgets)
+
+        # Remove from categories list
+        self.categories = [c for c in self.categories if c["name"] != cat]
+        self.save_json(CATEGORIES_FILE, self.categories)
+        self.update_categories_table()
+        self.save_and_refresh()
+
     # ---------------- Dashboard Tab ----------------
     def init_dashboard_tab(self):
         main_layout = QVBoxLayout()
 
+        # Top: Net worth + today + local range controls
+        header_row = QHBoxLayout()
         self.dashboard_balance_label = QLabel()
-        main_layout.addWidget(self.dashboard_balance_label)
+        header_row.addWidget(self.dashboard_balance_label)
+        header_row.addStretch()
 
+        header_row.addWidget(QLabel("Range:"))
+        self.dashboard_range_dropdown = QComboBox()
+        self.dashboard_range_dropdown.addItems(["This Month", "Last Month", "YTD", "Custom"])
+        self.dashboard_range_dropdown.setCurrentText(self.dashboard_filter_mode)
+        header_row.addWidget(self.dashboard_range_dropdown)
+
+        self.dashboard_from_picker = QDateEdit()
+        self.dashboard_from_picker.setCalendarPopup(True)
+        self.dashboard_from_picker.setDisplayFormat("yyyy-MM-dd")
+        self.dashboard_to_picker = QDateEdit()
+        self.dashboard_to_picker.setCalendarPopup(True)
+        self.dashboard_to_picker.setDisplayFormat("yyyy-MM-dd")
+        header_row.addWidget(QLabel("From:"))
+        header_row.addWidget(self.dashboard_from_picker)
+        header_row.addWidget(QLabel("To:"))
+        header_row.addWidget(self.dashboard_to_picker)
+
+        main_layout.addLayout(header_row)
+
+        # Initially hide pickers unless Custom
+        self.dashboard_from_picker.hide()
+        self.dashboard_to_picker.hide()
+
+        # Wire range controls
+        self.dashboard_range_dropdown.currentTextChanged.connect(self.on_dashboard_range_changed)
+        self.dashboard_from_picker.dateChanged.connect(lambda *_: self.update_dashboard_tab())
+        self.dashboard_to_picker.dateChanged.connect(lambda *_: self.update_dashboard_tab())
+
+        # Grid layout for widgets
         grid = QGridLayout()
 
-        # Budgets summary
-        budgets_group = QGroupBox("Budgets Summary (Month-to-Date)")
+        # Budgets summary (budgeted only) with progress bars + subtitle
+        budgets_group = QGroupBox("Budgets (Budgeted Categories Only)")
         budgets_layout = QVBoxLayout()
+        subtitle = QLabel("<i>Monthly equivalents shown</i>")
+        budgets_layout.addWidget(subtitle)
         self.dashboard_budget_table = QTableWidget()
-        self.dashboard_budget_table.setColumnCount(4)
-        self.dashboard_budget_table.setHorizontalHeaderLabels(["Category", "Spent", "Budget (Monthly Eq.)", "Remaining"])
+        self.dashboard_budget_table.setColumnCount(5)
+        self.dashboard_budget_table.setHorizontalHeaderLabels(["Category", "Spent (in range)", "Budget (Monthly Eq.)", "Remaining", "Progress"])
         budgets_layout.addWidget(self.dashboard_budget_table)
         budgets_group.setLayout(budgets_layout)
-        grid.addWidget(budgets_group, 0, 0)
+        grid.addWidget(budgets_group, 0, 0, 1, 2)
 
-        # Recent transactions
-        recent_group = QGroupBox("Recent Transactions")
+        # Recent transactions (respecting dashboard range)
+        recent_group = QGroupBox("Recent Transactions (within range)")
         recent_layout = QVBoxLayout()
         self.dashboard_recent_table = QTableWidget()
         self.dashboard_recent_table.setColumnCount(4)
@@ -947,44 +1466,78 @@ class FinanceApp(QWidget):
         self.btn_view_all_tx.clicked.connect(lambda: self.tabs.setCurrentWidget(self.trans_tab))
         recent_layout.addWidget(self.btn_view_all_tx)
         recent_group.setLayout(recent_layout)
-        grid.addWidget(recent_group, 0, 1)
+        grid.addWidget(recent_group, 1, 0)
 
-        # Spend by Account (MTD)
-        acct_group = QGroupBox("MTD Spend by Account")
+        # Spend by Account (range)
+        acct_group = QGroupBox("Spend by Account (Expenses in range)")
         acct_layout = QVBoxLayout()
         self.dashboard_spend_by_acct_table = QTableWidget()
         self.dashboard_spend_by_acct_table.setColumnCount(2)
         self.dashboard_spend_by_acct_table.setHorizontalHeaderLabels(["Account", "Spent"])
         acct_layout.addWidget(self.dashboard_spend_by_acct_table)
         acct_group.setLayout(acct_layout)
-        grid.addWidget(acct_group, 1, 0, 1, 2)
+        grid.addWidget(acct_group, 1, 1)
+
+        # Row 2: Spend by Category (list + donut) in range
+        # Left: list
+        cat_list_group = QGroupBox("Spend by Category (Expenses in range) — List")
+        cat_list_layout = QVBoxLayout()
+        self.dashboard_spend_by_cat_table = QTableWidget()
+        self.dashboard_spend_by_cat_table.setColumnCount(2)
+        self.dashboard_spend_by_cat_table.setHorizontalHeaderLabels(["Category", "Spent"])
+        cat_list_layout.addWidget(self.dashboard_spend_by_cat_table)
+        cat_list_group.setLayout(cat_list_layout)
+        grid.addWidget(cat_list_group, 2, 0)
+
+        # Right: donut pie
+        pie_group = QGroupBox("Spend by Category (Expenses in range) — Chart")
+        pie_layout = QVBoxLayout()
+        self.mtd_category_pie = MplCanvas(width=4.5, height=3.6, dpi=100)
+        pie_layout.addWidget(self.mtd_category_pie)
+        pie_group.setLayout(pie_layout)
+        grid.addWidget(pie_group, 2, 1)
 
         main_layout.addLayout(grid)
         self.dashboard_tab.setLayout(main_layout)
 
         self.update_dashboard_tab()
 
-    def get_spend_by_category_month_to_date(self) -> dict[str, float]:
+    # Dashboard range helpers
+    def compute_dashboard_range(self):
+        today = self.get_today()
+        mode = self.dashboard_range_dropdown.currentText()
+        if mode == "This Month":
+            return start_of_month(today), today
+        if mode == "Last Month":
+            first_this = start_of_month(today)
+            last_end = first_this - datetime.timedelta(days=1)
+            return start_of_month(last_end), last_end
+        if mode == "YTD":
+            return today.replace(month=1, day=1), today
+        if mode == "Custom":
+            f = self.dashboard_from_picker.date().toPython()
+            t = self.dashboard_to_picker.date().toPython()
+            if f > t:
+                f, t = t, f
+            return f, t
+        return start_of_month(today), today
+
+    # Generic spend aggregations for any range
+    def get_spend_by_category_in_range(self, start: datetime.date, end: datetime.date) -> dict[str, float]:
         if self.df.empty:
             return {}
-        today = self.get_today()
-        start = start_of_month(today)
-        end = end_of_month(today)
         df = self.df.copy()
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
         if df.empty:
             return {}
-        df['Category'] = df['Category'].astype(str).str.lower().str.capitalize()
+        df['Category'] = df['Category'].astype(str)
         spent = df.groupby('Category')['Amount'].apply(lambda x: abs(x[x < 0].sum())).to_dict()
         return spent
 
-    def get_spend_by_account_month_to_date(self) -> dict[str, float]:
+    def get_spend_by_account_in_range(self, start: datetime.date, end: datetime.date) -> dict[str, float]:
         if self.df.empty:
             return {}
-        today = self.get_today()
-        start = start_of_month(today)
-        end = end_of_month(today)
         df = self.df.copy()
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
@@ -994,72 +1547,136 @@ class FinanceApp(QWidget):
         spent = df.groupby('Account')['Amount'].apply(lambda x: abs(x[x < 0].sum())).to_dict()
         return spent
 
-    def get_recent_transactions(self, n=10) -> pd.DataFrame:
+    def get_recent_transactions_in_range(self, start: datetime.date, end: datetime.date, n=10) -> pd.DataFrame:
         if self.df.empty:
             return self.df.copy()
         df = self.df.copy()
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
         df = df.sort_values('Date', ascending=False)
         return df.head(n).reset_index(drop=True)
 
-    def get_total_balance(self) -> float:
-        return sum(float(a["balance"]) for a in self.accounts) if self.accounts else 0.0
+    def _draw_donut(self, ax, labels, values, center_text):
+        ax.clear()
+        self.mtd_category_pie.set_dark()
+        wedges, _ = ax.pie(
+            values,
+            labels=None,  # legend instead
+            startangle=90,
+            wedgeprops=dict(width=0.42, edgecolor=DARK_FIG)
+        )
+        ax.text(0, 0, center_text, ha='center', va='center', color=LIGHT_TEXT, fontsize=12, fontweight='bold')
+        ax.axis('equal')
+        ax.legend(wedges, labels, loc='center left', bbox_to_anchor=(1.0, 0.5),
+                  facecolor=DARK_AX, labelcolor=LIGHT_TEXT, framealpha=0.0)
+
+    def _draw_category_donut_for_range(self, start: datetime.date, end: datetime.date):
+        spent_by_cat = self.get_spend_by_category_in_range(start, end)
+        spent_by_cat = {k: v for k, v in spent_by_cat.items() if v > 0}
+        labels = []
+        sizes = []
+        total = 0.0
+        if spent_by_cat:
+            pairs = sorted(spent_by_cat.items(), key=lambda x: -x[1])
+            top = pairs[:10]
+            others = pairs[10:]
+            labels = [k for k, _ in top]
+            sizes = [v for _, v in top]
+            if others:
+                labels.append("Other")
+                sizes.append(sum(v for _, v in others))
+            total = sum(sizes)
+
+        ax = self.mtd_category_pie.ax
+        if sizes:
+            self._draw_donut(ax, labels, sizes, fmt_money(total))
+        else:
+            ax.clear()
+            self.mtd_category_pie.set_dark()
+            ax.text(0.5, 0.5, "No expense data", ha='center', va='center', color=LIGHT_TEXT)
+            ax.axis('off')
+        self.mtd_category_pie.draw()
+
+    def on_dashboard_range_changed(self, *_):
+        mode = self.dashboard_range_dropdown.currentText()
+        if mode == "Custom":
+            self.dashboard_from_picker.show()
+            self.dashboard_to_picker.show()
+            # initialize to current month
+            today = self.get_today()
+            self.dashboard_from_picker.setDate(QDate(start_of_month(today).year, start_of_month(today).month, start_of_month(today).day))
+            self.dashboard_to_picker.setDate(QDate(today.year, today.month, today.day))
+        else:
+            self.dashboard_from_picker.hide()
+            self.dashboard_to_picker.hide()
+        self.update_dashboard_tab()
 
     def update_dashboard_tab(self):
-        total = self.get_total_balance()
+        # Net worth + today
+        total = sum(float(a["balance"]) for a in self.accounts) if self.accounts else 0.0
         eff_today = self.get_today().strftime("%Y-%m-%d")
         self.dashboard_balance_label.setText(
             f"Total Balance Across All Accounts: <b>{fmt_money(total)}</b> &nbsp;&nbsp; "
             f"<span style='color:gray;'>[Today: {eff_today}]</span>"
         )
 
-        # Budgets summary using monthly equivalent vs MTD spend
-        spent_by_cat = self.get_spend_by_category_month_to_date()
-        all_categories = set(spent_by_cat.keys()) | set(self.budgets.keys())
+        # Range
+        start, end = self.compute_dashboard_range()
+
+        # Budgets summary: ONLY budgeted categories; spent within range; budget = monthly eq (subtitle explains)
         today = self.get_today()
+        spent_by_cat = self.get_spend_by_category_in_range(start, end)
         rows = []
-        for cat in all_categories:
-            spent = spent_by_cat.get(cat, 0.0)
+        for cat in sorted(self.budgets.keys(), key=lambda x: x.lower()):
             bdata = self.budgets.get(cat)
-            if isinstance(bdata, dict):
-                meq = self.monthly_equivalent(bdata.get("amount", 0.0), bdata.get("period", "monthly"), today)
-            else:
-                meq = None
-            remaining = (meq - spent) if meq is not None else ""
+            meq = self.monthly_equivalent(bdata.get("amount", 0.0), bdata.get("period", "monthly"), today)
+            spent = spent_by_cat.get(cat, 0.0)
+            remaining = meq - spent
             rows.append({"category": cat, "spent": spent, "budget_meq": meq, "remaining": remaining})
-        rows.sort(key=lambda x: (0 if x['budget_meq'] is not None else 1, x['category']))
 
         self.dashboard_budget_table.setRowCount(len(rows))
         for r, data in enumerate(rows):
             self.dashboard_budget_table.setItem(r, 0, QTableWidgetItem(data["category"]))
+
             spent_item = QTableWidgetItem(fmt_money(data["spent"]))
             spent_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.dashboard_budget_table.setItem(r, 1, spent_item)
 
-            if data["budget_meq"] is not None:
-                me_item = QTableWidgetItem(fmt_money(data["budget_meq"]))
-                me_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.dashboard_budget_table.setItem(r, 2, me_item)
+            me_item = QTableWidgetItem(fmt_money(data["budget_meq"]))
+            me_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.dashboard_budget_table.setItem(r, 2, me_item)
 
-                rem_val = data["remaining"]
-                rem_item = QTableWidgetItem(fmt_money(rem_val))
-                rem_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if rem_val < 0:
-                    rem_item.setForeground(Qt.red)
-                    rem_item.setText(f"Over by {fmt_money(-rem_val)}")
-                else:
-                    rem_item.setForeground(Qt.darkGreen)
-                self.dashboard_budget_table.setItem(r, 3, rem_item)
+            rem_val = data["remaining"]
+            rem_item = QTableWidgetItem(fmt_money(rem_val))
+            rem_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if rem_val < 0:
+                rem_item.setForeground(Qt.red)
+                rem_item.setText(f"Over by {fmt_money(-rem_val)}")
             else:
-                self.dashboard_budget_table.setItem(r, 2, QTableWidgetItem("No budget"))
-                nb = QTableWidgetItem("No budget set")
-                nb.setForeground(Qt.gray)
-                self.dashboard_budget_table.setItem(r, 3, nb)
+                rem_item.setForeground(Qt.darkGreen)
+            self.dashboard_budget_table.setItem(r, 3, rem_item)
+
+            # Progress bar: allow >100%
+            bar = QProgressBar()
+            pct = 0
+            if data["budget_meq"] > 0:
+                pct = round((data["spent"] / data["budget_meq"]) * 100)
+            max_val = max(100, int(pct)) if pct > 0 else 100
+            if pct < 0:
+                pct = 0
+            bar.setRange(0, max_val)
+            bar.setValue(int(pct))
+            bar.setFormat(f"{int(pct)}%")
+            if data["remaining"] < 0:
+                bar.setStyleSheet("QProgressBar::chunk { background-color: #c62828; } QProgressBar { color: white; }")
+            else:
+                bar.setStyleSheet("QProgressBar::chunk { background-color: #2e7d32; } QProgressBar { color: white; }")
+            self.dashboard_budget_table.setCellWidget(r, 4, bar)
 
         self.dashboard_budget_table.resizeColumnsToContents()
 
-        # Recent transactions
-        recent = self.get_recent_transactions(n=10)
+        # Recent transactions (within range)
+        recent = self.get_recent_transactions_in_range(start, end, n=10)
         if not recent.empty:
             recent_display = recent.copy()
             recent_display['Date'] = pd.to_datetime(recent_display['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
@@ -1077,8 +1694,8 @@ class FinanceApp(QWidget):
             self.dashboard_recent_table.setItem(r, 3, QTableWidgetItem(str(recent_display.iloc[r]['Category'])))
         self.dashboard_recent_table.resizeColumnsToContents()
 
-        # Spend by Account (MTD)
-        spend_acct = self.get_spend_by_account_month_to_date()
+        # Spend by Account (range)
+        spend_acct = self.get_spend_by_account_in_range(start, end)
         accts = sorted(spend_acct.keys())
         self.dashboard_spend_by_acct_table.setRowCount(len(accts))
         for r, name in enumerate(accts):
@@ -1087,6 +1704,183 @@ class FinanceApp(QWidget):
             amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.dashboard_spend_by_acct_table.setItem(r, 1, amt_item)
         self.dashboard_spend_by_acct_table.resizeColumnsToContents()
+
+        # Spend by Category (range) — list
+        spend_cat_pairs = sorted(self.get_spend_by_category_in_range(start, end).items(), key=lambda x: (-x[1], x[0]))
+        self.dashboard_spend_by_cat_table.setRowCount(len(spend_cat_pairs))
+        for r, (cat, amt) in enumerate(spend_cat_pairs):
+            self.dashboard_spend_by_cat_table.setItem(r, 0, QTableWidgetItem(cat))
+            amt_item = QTableWidgetItem(fmt_money(amt))
+            amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.dashboard_spend_by_cat_table.setItem(r, 1, amt_item)
+        self.dashboard_spend_by_cat_table.resizeColumnsToContents()
+
+        # Category donut (range)
+        self._draw_category_donut_for_range(start, end)
+
+    # ---------------- Reports Tab ----------------
+    def init_reports_tab(self):
+        layout = QVBoxLayout()
+
+        # Filter bar
+        filter_bar = QHBoxLayout()
+        filter_bar.addWidget(QLabel("Range:"))
+        self.reports_filter_dropdown = QComboBox()
+        self.reports_filter_dropdown.addItems(["This Month", "Last Month", "Last 3 Months", "This Year", "Custom Range"])
+        filter_bar.addWidget(self.reports_filter_dropdown)
+
+        filter_bar.addWidget(QLabel("From:"))
+        self.reports_from_picker = QDateEdit()
+        self.reports_from_picker.setCalendarPopup(True)
+        self.reports_from_picker.setDisplayFormat("yyyy-MM-dd")
+        self.reports_from_picker.setDate(QDate.currentDate())
+        filter_bar.addWidget(self.reports_from_picker)
+
+        filter_bar.addWidget(QLabel("To:"))
+        self.reports_to_picker = QDateEdit()
+        self.reports_to_picker.setCalendarPopup(True)
+        self.reports_to_picker.setDisplayFormat("yyyy-MM-dd")
+        self.reports_to_picker.setDate(QDate.currentDate())
+        filter_bar.addWidget(self.reports_to_picker)
+
+        self.reports_from_picker.hide()
+        self.reports_to_picker.hide()
+
+        self.reports_filter_dropdown.currentTextChanged.connect(self.on_reports_filter_changed)
+        self.reports_from_picker.dateChanged.connect(self.refresh_reports)
+        self.reports_to_picker.dateChanged.connect(self.refresh_reports)
+
+        layout.addLayout(filter_bar)
+
+        charts_grid = QGridLayout()
+
+        # Pie: Spending by Category (donut, dark)
+        self.reports_pie_group = QGroupBox("Spending by Category (Expenses Only)")
+        pie_layout = QVBoxLayout()
+        self.reports_pie = MplCanvas(width=5, height=4, dpi=100)
+        pie_layout.addWidget(self.reports_pie)
+        self.reports_pie_group.setLayout(pie_layout)
+        charts_grid.addWidget(self.reports_pie_group, 0, 0)
+
+        # Bar: Income vs Expenses by Month (dark)
+        self.reports_bar_group = QGroupBox("Income vs Expenses by Month")
+        bar_layout = QVBoxLayout()
+        self.reports_bar = MplCanvas(width=6, height=4, dpi=100)
+        bar_layout.addWidget(self.reports_bar)
+        self.reports_bar_group.setLayout(bar_layout)
+        charts_grid.addWidget(self.reports_bar_group, 0, 1)
+
+        layout.addLayout(charts_grid)
+        self.reports_tab.setLayout(layout)
+
+        self.refresh_reports()
+
+    def on_reports_filter_changed(self, *_):
+        mode = self.reports_filter_dropdown.currentText()
+        if mode == "Custom Range":
+            self.reports_from_picker.show()
+            self.reports_to_picker.show()
+        else:
+            self.reports_from_picker.hide()
+            self.reports_to_picker.hide()
+        self.refresh_reports()
+
+    def compute_reports_range(self):
+        today = self.get_today()
+        mode = self.reports_filter_dropdown.currentText()
+        if mode == "This Month":
+            return start_of_month(today), end_of_month(today)
+        if mode == "Last Month":
+            first_this = start_of_month(today)
+            last_end = first_this - datetime.timedelta(days=1)
+            return start_of_month(last_end), last_end
+        if mode == "Last 3 Months":
+            end = end_of_month(today)
+            # subtract 2 months from start of current month
+            mm = today.month
+            yy = today.year
+            mm2 = mm - 2
+            yy2 = yy
+            while mm2 <= 0:
+                mm2 += 12
+                yy2 -= 1
+            start = datetime.date(yy2, mm2, 1)
+            return start, end
+        if mode == "This Year":
+            return today.replace(month=1, day=1), today.replace(month=12, day=31)
+        if mode == "Custom Range":
+            return self.reports_from_picker.date().toPython(), self.reports_to_picker.date().toPython()
+        return start_of_month(today), end_of_month(today)
+
+    def refresh_reports(self):
+        ax_p = self.reports_pie.ax
+        ax_b = self.reports_bar.ax
+        self.reports_pie.set_dark()
+        self.reports_bar.set_dark()
+
+        if self.df.empty:
+            ax_p.clear(); ax_b.clear()
+            self.reports_pie.set_dark(); self.reports_bar.set_dark()
+            ax_p.text(0.5, 0.5, "No data", ha='center', va='center', color=LIGHT_TEXT); ax_p.axis('off')
+            ax_b.text(0.5, 0.5, "No data", ha='center', va='center', color=LIGHT_TEXT); ax_b.axis('off')
+            self.reports_pie.draw(); self.reports_bar.draw()
+            return
+
+        start, end = self.compute_reports_range()
+        df = self.df.copy()
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
+
+        # Pie: Spending by Category (expenses only, donut)
+        ax_p.clear(); self.reports_pie.set_dark()
+        if df.empty:
+            ax_p.text(0.5, 0.5, "No data", ha='center', va='center', color=LIGHT_TEXT); ax_p.axis('off')
+        else:
+            exp = df[df['Amount'] < 0].copy()
+            if exp.empty:
+                ax_p.text(0.5, 0.5, "No expense data", ha='center', va='center', color=LIGHT_TEXT); ax_p.axis('off')
+            else:
+                sums = exp.groupby('Category')['Amount'].sum().abs().sort_values(ascending=False)
+                labels = sums.index.tolist()
+                values = sums.values.tolist()
+                total = sums.sum()
+                if len(labels) > 12:
+                    top_labels = labels[:12]; top_values = values[:12]
+                    other_val = sum(values[12:])
+                    top_labels.append("Other"); top_values.append(other_val)
+                    labels, values = top_labels, top_values
+                wedges, _ = ax_p.pie(
+                    values, labels=None, startangle=90,
+                    wedgeprops=dict(width=0.42, edgecolor=DARK_FIG)
+                )
+                ax_p.text(0, 0, fmt_money(total), ha='center', va='center', color=LIGHT_TEXT, fontsize=12, fontweight='bold')
+                ax_p.axis('equal')
+                ax_p.legend(wedges, labels, loc='center left', bbox_to_anchor=(1.0, 0.5),
+                            facecolor=DARK_AX, labelcolor=LIGHT_TEXT, framealpha=0.0)
+        self.reports_pie.draw()
+
+        # Bar: Income vs Expenses by Month (dark)
+        ax_b.clear(); self.reports_bar.set_dark()
+        if df.empty:
+            ax_b.text(0.5, 0.5, "No data", ha='center', va='center', color=LIGHT_TEXT); ax_b.axis('off')
+        else:
+            temp = df.copy()
+            temp['YearMonth'] = temp['Date'].dt.to_period('M').astype(str)
+            inc = temp[temp['Amount'] > 0].groupby('YearMonth')['Amount'].sum()
+            exp = temp[temp['Amount'] < 0].groupby('YearMonth')['Amount'].sum().abs()
+            months = sorted(set(inc.index).union(set(exp.index)))
+            inc_vals = [inc.get(m, 0.0) for m in months]
+            exp_vals = [exp.get(m, 0.0) for m in months]
+            x = range(len(months))
+            width = 0.38
+            ax_b.bar([i - width/2 for i in x], inc_vals, width, label="Income")
+            ax_b.bar([i + width/2 for i in x], exp_vals, width, label="Expenses")
+            ax_b.set_xticks(list(x))
+            ax_b.set_xticklabels(months, rotation=45, ha='right', color=LIGHT_TEXT)
+            ax_b.legend(facecolor=DARK_AX, labelcolor=LIGHT_TEXT, framealpha=0.0)
+            ax_b.set_ylabel("Amount", color=LIGHT_TEXT)
+            ax_b.grid(axis='y', color=GRID_COLOR, alpha=0.5)
+        self.reports_bar.draw()
 
     # ---------------- Settings Tab ----------------
     def init_settings_tab(self):
@@ -1130,11 +1924,12 @@ class FinanceApp(QWidget):
         self.settings["today_override"] = d.strftime("%Y-%m-%d")
         self.save_json(SETTINGS_FILE, self.settings)
         self.update_settings_info()
-        # Refresh everywhere that depends on date/time
+        # Refresh everywhere
         self.update_table()
         self.update_summary()
         self.update_budgets_table()
         self.update_dashboard_tab()
+        self.refresh_reports()
         QMessageBox.information(self, "Saved", "Today override saved.")
 
     def on_reset_today(self):
@@ -1147,6 +1942,7 @@ class FinanceApp(QWidget):
         self.update_summary()
         self.update_budgets_table()
         self.update_dashboard_tab()
+        self.refresh_reports()
         QMessageBox.information(self, "Reset", "Today override cleared. Using system date.")
 
     # ---------------- Tab change hook ----------------
@@ -1161,6 +1957,10 @@ class FinanceApp(QWidget):
         elif name == "Transactions":
             self.update_table()
             self.update_summary()
+        elif name == "Categories":
+            self.update_categories_table()
+        elif name == "Reports":
+            self.refresh_reports()
 
 
 # ----------------------------
