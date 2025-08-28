@@ -1,0 +1,31 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# --- Virtual environment ---
+venv/
+.env/
+.venv/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+
+# --- Project Data (local storage) ---
+transactions.csv
+budgets.json
+accounts.json
+categories.json
+settings.json
+
+# --- Logs / Temp ---
+*.log
+*.tmp
