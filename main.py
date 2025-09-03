@@ -9,9 +9,11 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QLabel, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QMessageBox, QMenu,QMenuBar, QMessageBox,
     QTabWidget, QHBoxLayout, QComboBox, QDateEdit, QGroupBox, QGridLayout,
-    QProgressBar
+    QProgressBar, QCheckBox
 )
 from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import QAbstractItemView  # needed in __init__ for sidebar selection mode
+
 
 # Matplotlib (for Reports & Dashboard charts)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -401,7 +403,87 @@ class FinanceApp(QWidget):
 
         # ------- Tabs (Dashboard first) -------
         self.tabs = QTabWidget()
+        # --- Sprint 11: Faux sidebar with horizontal labels ---
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem, QHBoxLayout
+        from PySide6.QtWidgets import QAbstractItemView
+
+        # Build sidebar items in the same order as tabs
+        self.sidebar = QListWidget()
+        self.sidebar.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.sidebar.setUniformItemSizes(True)
+        self.sidebar.setSpacing(4)
+        self.sidebar.setFixedWidth(180)
+
+        # Populate from the existing tabs
+        for i in range(self.tabs.count()):
+            item = QListWidgetItem(self.tabs.tabText(i))
+            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.sidebar.addItem(item)
+
+        # Keep sidebar and tabs in sync
+        def _side_to_tab(row):
+            if 0 <= row < self.tabs.count():
+                self.tabs.setCurrentIndex(row)
+        def _tab_to_side(idx):
+            if 0 <= idx < self.sidebar.count():
+                self.sidebar.setCurrentRow(idx)
+
+        self.sidebar.currentRowChanged.connect(_side_to_tab)
+        self.tabs.currentChanged.connect(_tab_to_side)
+
+        # Hide the real tab bar (we’ll use the sidebar)
+        self.tabs.tabBar().show()
+
+        # Put sidebar + tabs into a horizontal container
+        self._center_container = QWidget()
+        _center_layout = QHBoxLayout(self._center_container)
+        _center_layout.setContentsMargins(0,0,0,0)
+        _center_layout.setSpacing(0)
+        _center_layout.addWidget(self.sidebar)
+        _center_layout.addWidget(self.tabs, 1)
+
+        # Make tabs look/behave like a left sidebar
+        self.tabs.setTabPosition(QTabWidget.West)
+        self.tabs.setMovable(False)
+        self.tabs.setDocumentMode(True)  # flatter look
+
+        # Sidebar styling
+        self.tabs.setStyleSheet("""
+        /* Sidebar width & spacing */
+        QTabWidget::pane { border: 0; }
+        QTabBar::tab {
+            padding: 10px 14px;
+            margin: 2px 0;
+            min-width: 160px;
+            border-radius: 8px;
+            text-align: left;
+        }
+        QTabBar::tab:selected {
+            background: #2a2f36;
+            color: white;
+            font-weight: 600;
+        }
+        QTabBar::tab:!selected {
+            background: transparent;
+            color: #c8cdd4;
+        }
+        """)
+
+        # Gentle, app-wide widget rounding for cards/panels
+        self.setStyleSheet(self.styleSheet() + """
+        QGroupBox {
+            border: 1px solid #2a2f36; border-radius: 12px; margin-top: 16px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin; left: 8px; padding: 0px 6px 0px 6px;
+        }
+        QTableWidget {
+            gridline-color: #2a2f36;
+        }
+        """)
+
         self.layout.addWidget(self.tabs)
+
 
         # Dashboard first
         self.dashboard_tab = QWidget()
@@ -568,9 +650,11 @@ class FinanceApp(QWidget):
         return raw
 
     def load_transactions(self) -> pd.DataFrame:
-        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']
+        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
+                'AppliedToBalance', 'ExternalId', 'TransferGroup']
         try:
             df = pd.read_csv(TRANSACTIONS_FILE, dtype=str)
+
         except FileNotFoundError:
             df = pd.DataFrame(columns=cols)
 
@@ -616,11 +700,13 @@ class FinanceApp(QWidget):
         else:
             df = pd.DataFrame(columns=cols)
 
-        df = df[['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']]
+        df = df[['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
+         'AppliedToBalance', 'ExternalId', 'TransferGroup']]
         return df
 
     def save_transactions(self):
-        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']
+        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
+            'AppliedToBalance', 'ExternalId', 'TransferGroup']
         for c in cols:
             if c not in self.df.columns:
                 self.df[c] = ""
@@ -746,7 +832,7 @@ class FinanceApp(QWidget):
         # Make selection operate on full rows (so Edit/Delete can find the right Id)
         from PySide6.QtWidgets import QAbstractItemView  # ok to repeat import; or move to top
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
         layout.addWidget(self.table)
 
@@ -755,18 +841,22 @@ class FinanceApp(QWidget):
         self.add_button = QPushButton("Add")
         self.edit_button = QPushButton("Edit")
         self.delete_button = QPushButton("Delete")
-        self.clear_tx_button = QPushButton("Clear All")  # NEW
+        self.clear_tx_button = QPushButton("Clear All")  # NEW Sprint 6
+        self.mark_transfer_button = QPushButton("Mark Transfer") # Sprint 10
 
         btn_row.addWidget(self.add_button)
         btn_row.addWidget(self.edit_button)
         btn_row.addWidget(self.delete_button)
         btn_row.addSpacing(12)
         btn_row.addWidget(self.clear_tx_button)  # NEW
+        btn_row.addSpacing(8)
+        btn_row.addWidget(self.mark_transfer_button)  # NEW sprint 10
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
         self.summary_label = QLabel()
         layout.addWidget(self.summary_label)
+        self.summary_label.hide()  # hide the bottom summary on Transactions per Sprint 11
 
         # Wire events
         self.txn_filter_dropdown.currentTextChanged.connect(self.on_txn_filter_changed)
@@ -778,8 +868,10 @@ class FinanceApp(QWidget):
         self.edit_button.clicked.connect(self._edit_selected_transaction)
         self.delete_button.clicked.connect(self._delete_selected_transaction)
         self.clear_tx_button.clicked.connect(self.clear_all_transactions)  # NEW
+        self.mark_transfer_button.clicked.connect(self._mark_selected_as_transfer) # Sprint 10
 
         self.trans_tab.setLayout(layout)
+        
 
         # Init fill
         self.update_table()
@@ -914,9 +1006,36 @@ class FinanceApp(QWidget):
             self.table.setColumnHidden(id_col, True)
 
         self.table.resizeColumnsToContents()
+        # Sprint 11: hide advanced columns unless turned on in Settings
+        self._apply_advanced_cols_visibility()
+
+    def _apply_advanced_cols_visibility(self):
+        # read setting (default False)
+        show = False
+        try:
+            show = bool(self.settings.get("show_advanced_columns", False))
+        except Exception:
+            pass
+
+        # Map header -> index from the live table
+        header_to_idx = {}
+        try:
+            for c in range(self.table.columnCount()):
+                header = self.table.horizontalHeaderItem(c).text()
+                header_to_idx[header] = c
+        except Exception:
+            return
+
+        for name in ["AppliedToBalance", "ExternalId", "TransferGroup"]:
+            if name in header_to_idx:
+                self.table.setColumnHidden(header_to_idx[name], not show)
+
 
     def update_summary(self):
         filtered_df = self.get_filtered_transactions()
+        # Exclude Transfers from category totals
+        filtered_df = filtered_df[filtered_df['Type'] != 'Transfer']
+
         if filtered_df.empty:
             self.summary_label.setText("No data.")
             return
@@ -976,8 +1095,11 @@ class FinanceApp(QWidget):
             "Type": new["Type"],
             "Category": new["Category"],
             "Account": new["Account"],
-            "AppliedToBalance": False
+            "AppliedToBalance": False,
+            "ExternalId": "",
+            "TransferGroup": ""
         }
+
         self.df.loc[len(self.df)] = new_row
         self.save_and_refresh()
     
@@ -1041,12 +1163,85 @@ class FinanceApp(QWidget):
         menu = QMenu(self)
         a_edit = menu.addAction("Edit Transaction")
         a_del = menu.addAction("Delete Transaction")
+        a_tx = menu.addAction("Mark as Transfer (select two rows)")  # NEW Sprint 10
         action = menu.exec(self.table.mapToGlobal(pos))
         row_id = self._selected_row_id()
         if action == a_edit and row_id:
             self._edit_transaction_by_id(row_id)
         elif action == a_del and row_id:
             self._delete_transaction_by_id(row_id)
+        elif action == a_tx:
+            self._mark_selected_as_transfer()  # NEW sprint 10
+
+    def _mark_selected_as_transfer(self):
+        # Gather exactly two selected rows
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        if len(rows) != 2:
+            QMessageBox.warning(self, "Mark Transfer", "Please select exactly two rows to mark as a transfer.")
+            return
+
+        # Helper: read a display row into fields by column name
+        display_df = self.sort_transactions_df(self.get_filtered_transactions())
+        def row_to_obj(r):
+            # Map visible row -> original Id (your table shows all columns, so we can map by position)
+            row_id = str(display_df.iloc[r]["Id"])
+            amt = float(display_df.iloc[r]["Amount"])
+            return {
+                "Id": row_id,
+                "Date": str(display_df.iloc[r]["Date"]),
+                "Vendor": str(display_df.iloc[r]["Vendor"]),
+                "Amount": amt,
+                "Type": str(display_df.iloc[r]["Type"]),
+                "Category": str(display_df.iloc[r]["Category"]),
+                "Account": str(display_df.iloc[r]["Account"]),
+            }
+
+        a = row_to_obj(rows[0])
+        b = row_to_obj(rows[1])
+
+        # Must be different accounts
+        if a["Account"] == b["Account"]:
+            QMessageBox.warning(self, "Mark Transfer", "The two transactions must be on different accounts.")
+            return
+
+        # Must be opposite signs
+        if a["Amount"] * b["Amount"] >= 0:
+            QMessageBox.warning(self, "Mark Transfer", "Amounts must be opposite in sign (one outflow, one inflow).")
+            return
+
+        # Optional: date proximity check (<= 10 days)
+        try:
+            da = dt.strptime(a["Date"], "%Y-%m-%d").date()
+            db = dt.strptime(b["Date"], "%Y-%m-%d").date()
+            if abs((da - db).days) > 10:
+                reply = QMessageBox.question(self, "Mark Transfer",
+                                            "Dates are more than 10 days apart. Link anyway?",
+                                            QMessageBox.Yes | QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    return
+        except Exception:
+            pass
+
+        # Link via a shared TransferGroup id
+        import uuid
+        tg = str(uuid.uuid4())
+
+        # Update backing df by Id
+        for row_id in (a["Id"], b["Id"]):
+            idx = self.df.index[self.df["Id"].astype(str) == str(row_id)]
+            if len(idx) == 1:
+                i = idx[0]
+                self.df.at[i, "Type"] = "Transfer"
+                self.df.at[i, "Category"] = "Transfer"
+                if "TransferGroup" not in self.df.columns:
+                    self.df["TransferGroup"] = ""
+                self.df.at[i, "TransferGroup"] = tg
+
+        # Persist & refresh
+        self.save_transactions()
+        self.update_table()
+        self.update_summary()
+        QMessageBox.information(self, "Transfer", "The two rows have been linked as a transfer.")
     
     def clear_all_transactions(self):
         if self.df.empty:
@@ -1061,7 +1256,8 @@ class FinanceApp(QWidget):
             return
 
         # Recreate empty dataframe with the expected columns
-        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account', 'AppliedToBalance']
+        cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
+        'AppliedToBalance', 'ExternalId', 'TransferGroup']
         self.df = pd.DataFrame(columns=cols)
         self.save_and_refresh()
         QMessageBox.information(self, "Transactions", "All transactions cleared.")
@@ -2121,6 +2317,31 @@ class FinanceApp(QWidget):
         self.btn_reset_today.clicked.connect(self.on_reset_today)
 
         self.update_settings_info()
+
+        # --- Sprint 11: debug toggle for advanced transaction columns ---
+        self.chk_show_adv_cols = QCheckBox("Show advanced transaction columns (AppliedToBalance, ExternalId, TransferGroup)")
+        val = False
+        try:
+            val = bool(self.settings.get("show_advanced_columns", False))
+        except Exception:
+            pass
+        self.chk_show_adv_cols.setChecked(val)
+        layout.addWidget(self.chk_show_adv_cols)
+
+
+        def _on_toggle_adv_cols(checked):
+            try:
+                self.settings["show_advanced_columns"] = bool(checked)
+                self.save_json("settings.json", self.settings)
+            except Exception:
+                pass
+            # Reapply visibility if Transactions table is visible
+            try:
+                self._apply_advanced_cols_visibility()
+            except Exception:
+                pass
+
+        self.chk_show_adv_cols.toggled.connect(_on_toggle_adv_cols)
 
     def update_settings_info(self):
         ov = self.settings.get("today_override")

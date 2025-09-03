@@ -4,10 +4,12 @@ import pandas as pd
 from datetime import datetime as dt
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog,
-    QStackedWidget, QFormLayout, QComboBox, QCheckBox, QTableWidget, QTableWidgetItem,
-    QAbstractItemView, QDialogButtonBox, QMessageBox
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
+    QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
+    QMessageBox, QFormLayout, QGroupBox, QDateEdit, QDialogButtonBox,
+    QCheckBox, QStackedWidget, QAbstractItemView
 )
+
 from PySide6.QtCore import Qt
 
 IMPORT_PROFILES_FILE = "import_profiles.json"
@@ -133,8 +135,11 @@ def clean_vendor(val):
     return " ".join(str(val or "").split())
 
 def dup_key(row):
-    ext = (row.get("ExternalId") or "").strip()
-    if ext: return f"ext::{ext}"
+    ext_val = row.get("ExternalId", "")
+    ext = str(ext_val).strip() if ext_val is not None else ""
+    if ext and ext.lower() != "nan":
+        return f"ext::{ext}"
+
     date = row.get("Date") or ""
     vendor = (row.get("Vendor") or "").lower().strip()
     try: amount = f"{float(row.get('Amount',0.0)):.2f}"
@@ -185,6 +190,8 @@ class ImportWizard(QDialog):
 
         # --- Step 2: mapping
         self.step2 = QDialog(self); s2 = QFormLayout(self.step2)
+        self.s2 = s2  # keep a reference to Step-2 form layout for later additions
+
 
         self.map_date = QComboBox(); self.map_vendor = QComboBox()
         self.amount_mode = QComboBox(); self.amount_mode.addItems(["Single Amount column", "Debit/Credit columns"])
@@ -230,6 +237,31 @@ class ImportWizard(QDialog):
 
         s2.addRow(QLabel("<b>Assign to Account (all rows)</b>"))
         s2.addRow("Account:", self.account_combo)
+
+        # ----- New controls for Sprint 9 -----
+        # Account Type (only used if a new account is being created / or to tag an existing one)
+        self.account_type_combo = QComboBox()
+        self.account_type_combo.addItems(["Asset", "Credit Card"])
+        self.account_type_combo.setToolTip("Used when creating a new account here. Optional for existing accounts.")
+        s2.addRow("Account Type:", self.account_type_combo)
+
+        # Account Initialization group
+        self.init_group = QGroupBox("Account Initialization")
+        init_layout = QFormLayout(self.init_group)
+
+        self.chk_init_from_import = QCheckBox("Initialize account balance from this import")
+        self.chk_init_from_import.setChecked(False)
+
+        self.init_net_label = QLabel("Computed net from this import: —")  # updated in preview
+        self.override_balance_edit = QLineEdit()
+        self.override_balance_edit.setPlaceholderText("Optional. Example: -2400 (use instead of computed net)")
+
+        init_layout.addRow(self.chk_init_from_import)
+        init_layout.addRow("Computed net:", self.init_net_label)
+        init_layout.addRow("Override balance:", self.override_balance_edit)
+
+        s2.addRow(self.init_group)
+        # ----- End new controls -----
 
         s2.addRow(QLabel("<b>Profile</b>"))
         s2.addRow(self.chk_remember)
@@ -343,6 +375,19 @@ class ImportWizard(QDialog):
         self.chk_thousands.setChecked(bool(self.mapping.get("thousands_sep", True)))
         self.chk_invert.setChecked(bool(self.mapping.get("invert_amount", False)))
 
+        # --- Normalization option (quick toggle) ---
+        if not hasattr(self, "chk_flip_signs"):
+            self.chk_flip_signs = QCheckBox("Flip amounts so expenses become negative")
+            self.chk_flip_signs.setToolTip(
+                "Enable this if your file uses credit-card style: purchases are positive and payments are negative.\n"
+                "When checked, the wizard will multiply all Amounts by -1 before import."
+            )
+            # Add into Step-2 form, on its own row
+            self.s2.addRow("", self.chk_flip_signs)
+            # Optional: live-update preview if user is on Step 3
+            self.chk_flip_signs.toggled.connect(self._rebuild_preview_if_on_step3)
+
+
         # account default
         if self.app.accounts:
             self.account_combo.setCurrentText(self.app.accounts[0]["name"])
@@ -359,6 +404,7 @@ class ImportWizard(QDialog):
         self.map_amount.setEnabled(is_single)
         self.map_debit.setEnabled(not is_single)
         self.map_credit.setEnabled(not is_single)
+        self._rebuild_preview_if_on_step3()  # NEW Sprint 9
 
     def on_account_changed(self, val):
         if val == "➕ Add new account…":
@@ -367,7 +413,12 @@ class ImportWizard(QDialog):
             if ok and name.strip():
                 try:
                     # create with zero starting balance; parent app persists
-                    self.app.accounts.append({"name": name.strip(), "balance": 0.0, "starting_balance": 0.0})
+                    self.app.accounts.append({
+                        "name": name.strip(),
+                        "balance": 0.0,
+                        "starting_balance": 0.0,
+                        "type": self.account_type_combo.currentText() if hasattr(self, "account_type_combo") else "Asset"
+                    })
                     self.app.save_json("accounts.json", self.app.accounts)
                 except Exception as e:
                     QMessageBox.critical(self, "Account", f"Could not create account:\n{e}")
@@ -383,6 +434,7 @@ class ImportWizard(QDialog):
                     self.account_choice = "Unassigned"
         else:
             self.account_choice = val
+            self._rebuild_preview_if_on_step3()  # NEW Sprint 9
 
     def validate_mapping(self):
         if not self.map_date.currentText().strip() or not self.map_vendor.currentText().strip():
@@ -419,20 +471,26 @@ class ImportWizard(QDialog):
         existing_keys = set()
         if not self.app.df.empty:
             for _, ex in self.app.df.iterrows():
-                try:
-                    amt = f"{float(ex.get('Amount',0.0)):.2f}"
-                except Exception:
-                    amt = "0.00"
-                key = f"{ex.get('Date','')}|{str(ex.get('Vendor') or '').lower().strip()}|{amt}|{ex.get('Account') or ''}"
-                existing_keys.add(key)
+                ex_row = {
+                    "Date": ex.get("Date", ""),
+                    "Vendor": (ex.get("Vendor") or ""),
+                    "Amount": ex.get("Amount", 0.0),
+                    "Account": ex.get("Account", ""),
+                    "ExternalId": (ex.get("ExternalId") or ""),
+                }
+                existing_keys.add(dup_key(ex_row))
 
         self.preview_rows = []; self.preview_flags = []; seen = set()
+        flip_quick = bool(getattr(self, "chk_flip_signs", None) and self.chk_flip_signs.isChecked())
+        invert_effective = bool(self.mapping.get("invert_amount", False)) ^ flip_quick  # XOR: only flip once
+
         opts = dict(
             strip_currency=self.mapping["strip_currency"],
             paren_negative=self.mapping["paren_negative"],
             thousands_sep=self.mapping["thousands_sep"],
-            invert=self.mapping["invert_amount"]
+            invert=invert_effective
         )
+
 
         for _, row in df.iterrows():
             date_val = parse_date_value(row.get(self.mapping["date"]), self.mapping["date_format"])
@@ -499,10 +557,33 @@ class ImportWizard(QDialog):
         ok = len(self.preview_rows) - dup_cnt - inv_cnt
         self.preview_info.setText(f"Rows: {len(self.preview_rows)}  |  Valid (non-dup): {ok}  |  Duplicates: {dup_cnt}  |  Invalid: {inv_cnt}")
 
+        # ---- NEW: compute net for initialization preview (valid + non-duplicate rows only) ----
+        net = 0.0
+        for i, row in enumerate(self.preview_rows):
+            flags = self.preview_flags[i]
+            if not flags["valid"] or flags["duplicate"]:
+                continue
+            try:
+                amt = float(row.get("Amount") or 0.0)
+            except Exception:
+                amt = 0.0
+            net += amt
+
+        # Update the Step-2 label so user sees the expected initialization value
+        # Note: account assignment is uniform for this import (Account column already set per row)
+        self.init_net_label.setText(f"{'$' + format(net, ',.2f')}")
+
+    def _rebuild_preview_if_on_step3(self, *_):
+        if self.stack.currentIndex() == 2:
+            self.build_preview()
+
     # ---------- Commit
     def on_commit(self):
         if not self.preview_rows:
-            QMessageBox.information(self, "Import", "No rows to import."); return
+            QMessageBox.information(self, "Import", "No rows to import.")
+            return
+
+        # Keep only valid, non-duplicate rows
         rows = []
         for i, row in enumerate(self.preview_rows):
             f = self.preview_flags[i]
@@ -512,7 +593,7 @@ class ImportWizard(QDialog):
             QMessageBox.information(self, "Import", "All rows are invalid or duplicates. Nothing to import.")
             return
 
-        # Backup transactions csv before write
+        # Backup transactions csv before write (best effort)
         try:
             tx_path = "sample_transactions.csv"
             if os.path.exists(tx_path):
@@ -521,24 +602,77 @@ class ImportWizard(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Backup", f"Backup failed (continuing):\n{e}")
 
+        # ---- NEW: determine initialization path and final init value (inside method) ----
+        def _parse_override(txt):
+            if not txt or not str(txt).strip():
+                return None
+            try:
+                return float(str(txt).strip())
+            except Exception:
+                return None
+
+        use_init = bool(self.chk_init_from_import.isChecked())
+        override_val = _parse_override(self.override_balance_edit.text())
+
+        # Compute net using exactly the rows we will commit (valid + non-dup)
+        net_for_init = 0.0
+        for r in rows:
+            try:
+                net_for_init += float(r.get("Amount") or 0.0)
+            except Exception:
+                pass
+
+        init_value = None
+        if override_val is not None:
+            init_value = override_val
+        elif use_init:
+            init_value = net_for_init
+
         # Append to parent df
         appended = 0
         for r in rows:
             try:
                 new_id = self.app._next_tx_id()
+                applied_flag = "True" if init_value is not None else "False"  # mark applied if used for init
                 self.app.df.loc[len(self.app.df)] = {
                     "Id": int(new_id),
                     "Date": r["Date"],
                     "Vendor": r["Vendor"],
                     "Amount": float(r["Amount"]),
+                    # Type remains based on sign; Transfer support comes in next sprint
                     "Type": "Expense" if float(r["Amount"]) < 0 else "Income",
                     "Category": "Uncategorized",
                     "Account": r.get("Account") or "Unassigned",
-                    "AppliedToBalance": "False"
+                    "AppliedToBalance": applied_flag,
+                    "ExternalId": r.get("ExternalId", ""),
                 }
                 appended += 1
             except Exception:
                 pass
+
+        # If initializing, set the selected/new account's balances now (starting_balance and balance)
+        try:
+            if init_value is not None:
+                acct_name = self.account_choice or "Unassigned"
+                # Update (or create) the account record in app.accounts
+                idx = next((i for i, a in enumerate(self.app.accounts) if a.get("name") == acct_name), None)
+                acct_type = self.account_type_combo.currentText() if hasattr(self, "account_type_combo") else "Asset"
+                if idx is None:
+                    # Should not happen (wizard already created account), but guard anyway
+                    self.app.accounts.append({
+                        "name": acct_name,
+                        "balance": float(init_value),
+                        "starting_balance": float(init_value),
+                        "type": acct_type
+                    })
+                else:
+                    # Update balances and type (non-breaking: main app ignores 'type' if unused)
+                    self.app.accounts[idx]["balance"] = float(init_value)
+                    self.app.accounts[idx]["starting_balance"] = float(init_value)
+                    self.app.accounts[idx]["type"] = acct_type
+                self.app.save_json("accounts.json", self.app.accounts)
+        except Exception as e:
+            QMessageBox.warning(self, "Account Initialization", f"Could not set account balance:\n{e}")
 
         # Save & refresh
         self.app.save_transactions()
@@ -551,33 +685,35 @@ class ImportWizard(QDialog):
                 "name": name,
                 "fingerprint": {"headers": lower_headers(self.headers), "ext": self.file_ext},
                 "mapping": {
-                    "date": self.mapping.get("date",""),
-                    "vendor": self.mapping.get("vendor",""),
-                    "amount_mode": self.mapping.get("amount_mode","single_amount"),
-                    "amount": self.mapping.get("amount",""),
-                    "debit": self.mapping.get("debit",""),
-                    "credit": self.mapping.get("credit",""),
-                    "memo": self.mapping.get("memo",""),
-                    "external_id": self.mapping.get("external_id",""),
-                    "balance": self.mapping.get("balance",""),
-                    "type": self.mapping.get("type",""),
-                    "date_format": self.mapping.get("date_format", None)
+                    "date": self.mapping.get("date", ""),
+                    "vendor": self.mapping.get("vendor", ""),
+                    "amount_mode": self.mapping.get("amount_mode", "single_amount"),
+                    "amount": self.mapping.get("amount", ""),
+                    "debit": self.mapping.get("debit", ""),
+                    "credit": self.mapping.get("credit", ""),
+                    "memo": self.mapping.get("memo", ""),
+                    "external_id": self.mapping.get("external_id", ""),
+                    "balance": self.mapping.get("balance", ""),
+                    "type": self.mapping.get("type", ""),
+                    "date_format": self.mapping.get("date_format", None),
                 },
                 "cleaners": {
                     "strip_currency": self.mapping.get("strip_currency", True),
                     "paren_negative": self.mapping.get("paren_negative", True),
                     "thousands_sep": self.mapping.get("thousands_sep", True),
-                    "invert_amount": self.mapping.get("invert_amount", False)
-                }
+                    "invert_amount": self.mapping.get("invert_amount", False),
+                },
             }
             profiles = load_profiles()
             # overwrite by name if exists
             for i, p in enumerate(profiles):
-                if p.get("name","") == name:
-                    profiles[i] = prof; break
+                if p.get("name", "") == name:
+                    profiles[i] = prof
+                    break
             else:
                 profiles.append(prof)
             save_profiles(profiles)
 
         QMessageBox.information(self, "Import complete", f"Imported {appended} transaction(s).")
         self.accept()
+
