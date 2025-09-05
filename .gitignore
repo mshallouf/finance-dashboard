@@ -20,7 +20,6 @@ venv/
 Thumbs.db
 
 # --- Project Data (local storage) ---
-sample_transactions.csv
 budgets.json
 accounts.json
 categories.json
@@ -29,3 +28,20 @@ settings.json
 # --- Logs / Temp ---
 *.log
 *.tmp
+
+# user data files
+accounts.json
+budgets.json
+categories.json
+settings.json
+import_profiles.json
+
+# backups created by import wizard
+sample_transactions.backup-*.csv
+sample_transactions.csv
+
+#folders
+App Screenshots/
+Monarch/
+
+

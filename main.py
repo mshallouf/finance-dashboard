@@ -12,7 +12,10 @@ from PySide6.QtWidgets import (
     QProgressBar, QCheckBox
 )
 from PySide6.QtCore import Qt, QDate
-from PySide6.QtWidgets import QAbstractItemView  # needed in __init__ for sidebar selection mode
+
+from PySide6.QtWidgets import QListWidget, QListWidgetItem
+from PySide6.QtWidgets import QAbstractItemView
+from PySide6.QtWidgets import QHBoxLayout
 
 
 # Matplotlib (for Reports & Dashboard charts)
@@ -23,13 +26,20 @@ from matplotlib.figure import Figure
 # File paths / constants
 # ----------------------------
 TRANSACTIONS_FILE = "sample_transactions.csv"
+AUTOCAT_FILE = "autocategorize.json"   # Sprint 12: vendor→category memory
+UNCATEGORIZED = "Uncategorized"        # used throughout (normalize blank categories)
 BUDGET_FILE = "budgets.json"
 ACCOUNTS_FILE = "accounts.json"
 SETTINGS_FILE = "settings.json"
 CATEGORIES_FILE = "categories.json"
-
 UNCATEGORIZED = "Uncategorized"
 NEW_CATEGORY_OPTION = "➕ New category…"
+
+SYSTEM_CATEGORIES = {"Transfer"}
+
+def is_system_category(name: str) -> bool:
+    return str(name or "").strip().lower() in {n.lower() for n in SYSTEM_CATEGORIES}
+
 
 # Dark theme colors
 DARK_FIG = "#121212"
@@ -55,6 +65,39 @@ def fmt_money(value) -> str:
         return f"${float(value):,.2f}"
     except Exception:
         return str(value)
+
+# --- Sprint 12: Auto-categorize helpers (must be defined BEFORE FinanceApp) ---
+import re
+from difflib import SequenceMatcher
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+def _normalize_vendor(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).lower()
+    # collapse punctuation/whitespace to single spaces
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _vendor_tokens(s: str) -> list[str]:
+    s = _normalize_vendor(s)
+    return _WORD_RE.findall(s)
+
+def _vendor_stem(s: str, n: int = 2) -> str:
+    """First N tokens as a coarse vendor root; ex: 'petro canada xyz' -> 'petro canada'."""
+    toks = _vendor_tokens(s)
+    return " ".join(toks[:n]) if toks else ""
+
+def _token_overlap(a: str, b: str) -> int:
+    at = set(_vendor_tokens(a))
+    bt = set(_vendor_tokens(b))
+    return len(at & bt)
+
+def _sim(a: str, b: str) -> float:
+    return SequenceMatcher(None, _normalize_vendor(a), _normalize_vendor(b)).ratio()
+# --- end helpers ---
 
 
 # ----------------------------
@@ -165,6 +208,7 @@ class AddTransactionDialog(QDialog):
             names = [UNCATEGORIZED] + names
         if NEW_CATEGORY_OPTION not in names:
             names = names + [NEW_CATEGORY_OPTION]
+        names = [n for n in names if not is_system_category(n)]
         self.category_dropdown.addItems(sorted([n for n in names if n not in [NEW_CATEGORY_OPTION, UNCATEGORIZED]])
                                        + [UNCATEGORIZED, NEW_CATEGORY_OPTION])
 
@@ -291,10 +335,12 @@ class BudgetDialog(QDialog):
 
         self.category_dropdown = QComboBox(self)
         cats = categories_expense or [UNCATEGORIZED]
+        # Drop system categories like Transfer
+        cats = [c for c in cats if not is_system_category(c)]
         if UNCATEGORIZED not in cats:
             cats = [UNCATEGORIZED] + list(cats)
         self.category_dropdown.addItems(sorted(cats))
-        self.layout.addRow("Category:", self.category_dropdown)
+
 
         self.amount_input = QLineEdit(self)
         self.layout.addRow("Amount:", self.amount_input)
@@ -364,6 +410,58 @@ class AccountDialog(QDialog):
 # ----------------------------
 # Main App
 # ----------------------------
+import re
+from difflib import SequenceMatcher
+import os, json
+
+def _normalize_vendor(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).lower()
+    # collapse punctuation and whitespace
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _sim(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+# --- Seed loaders/mergers for external JSON files (Sprint 13) ---
+def _read_json_file(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _merge_seed_categories_from_file(existing: list[dict], seed_path: str) -> list[dict]:
+    seed = _read_json_file(seed_path, {"categories": []})
+    seed_list = seed.get("categories", []) or []
+    existing = existing or []
+    have = {str(c.get("name","")).strip().lower() for c in existing}
+    out = existing[:]
+    for c in seed_list:
+        nm = str(c.get("name","")).strip()
+        if nm and nm.lower() not in have:
+            out.append({"name": nm})
+            have.add(nm.lower())
+    return out
+
+def _merge_seed_autocat_from_file(existing: dict, seed_path: str) -> dict:
+    seed = _read_json_file(seed_path, {"vendors": {}})
+    vendors = seed.get("vendors", {}) or {}
+    out = dict(existing or {})
+    for k, v in vendors.items():
+        if k not in out:
+            out[k] = v  # seed as string; runtime upgrades to counters after confirmations
+    return out
+
+def _project_path(*parts: str) -> str:
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *parts)
+
+    
+
 class FinanceApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -379,7 +477,39 @@ class FinanceApp(QWidget):
         self.budgets = self.migrate_budgets(self.load_json(BUDGET_FILE, default={}))
         self.accounts = self.ensure_accounts_fields(self.load_json(ACCOUNTS_FILE, default=[]))
         self.settings = self.load_json(SETTINGS_FILE, default={"today_override": None})
+        
+        # Sprint 12: load vendor→category memory and defaults
+        self.autocat = self.load_json(AUTOCAT_FILE, default={})
+        # Default settings for auto-categorization
+        if "auto_categorize_enabled" not in self.settings:
+            self.settings["auto_categorize_enabled"] = True
+        if "auto_categorize_threshold" not in self.settings:
+            self.settings["auto_categorize_threshold"] = 0.70
+        # persist defaults if we added them
+        self.save_json(SETTINGS_FILE, self.settings)
+
         self.categories = self.ensure_categories(self.load_json(CATEGORIES_FILE, default=[]))
+        # Seed/merge categories from seeds/categories_seed.json (idempotent)
+        try:
+            seed_path = _project_path("seeds", "categories_seed.json")
+            merged = _merge_seed_categories_from_file(self.categories, seed_path)
+            if merged != self.categories:
+                self.categories = merged
+                self.save_json(CATEGORIES_FILE, self.categories)
+        except Exception:
+            pass
+
+        # Seed/merge Ontario/SW-ON vendor map from seeds/autocategorize_seed_on_ca.json (idempotent)
+        try:
+            seed_path = _project_path("seeds", "autocategorize_seed_on_ca.json")
+            merged = _merge_seed_autocat_from_file(self.autocat, seed_path)
+            if merged != self.autocat:
+                self.autocat = merged
+                self.save_json(AUTOCAT_FILE, self.autocat)
+        except Exception:
+            pass
+
+
 
         # Dashboard local filter state
         self.dashboard_filter_mode = "This Month"
@@ -403,88 +533,7 @@ class FinanceApp(QWidget):
 
         # ------- Tabs (Dashboard first) -------
         self.tabs = QTabWidget()
-        # --- Sprint 11: Faux sidebar with horizontal labels ---
-        from PySide6.QtWidgets import QListWidget, QListWidgetItem, QHBoxLayout
-        from PySide6.QtWidgets import QAbstractItemView
-
-        # Build sidebar items in the same order as tabs
-        self.sidebar = QListWidget()
-        self.sidebar.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.sidebar.setUniformItemSizes(True)
-        self.sidebar.setSpacing(4)
-        self.sidebar.setFixedWidth(180)
-
-        # Populate from the existing tabs
-        for i in range(self.tabs.count()):
-            item = QListWidgetItem(self.tabs.tabText(i))
-            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self.sidebar.addItem(item)
-
-        # Keep sidebar and tabs in sync
-        def _side_to_tab(row):
-            if 0 <= row < self.tabs.count():
-                self.tabs.setCurrentIndex(row)
-        def _tab_to_side(idx):
-            if 0 <= idx < self.sidebar.count():
-                self.sidebar.setCurrentRow(idx)
-
-        self.sidebar.currentRowChanged.connect(_side_to_tab)
-        self.tabs.currentChanged.connect(_tab_to_side)
-
-        # Hide the real tab bar (we’ll use the sidebar)
-        self.tabs.tabBar().show()
-
-        # Put sidebar + tabs into a horizontal container
-        self._center_container = QWidget()
-        _center_layout = QHBoxLayout(self._center_container)
-        _center_layout.setContentsMargins(0,0,0,0)
-        _center_layout.setSpacing(0)
-        _center_layout.addWidget(self.sidebar)
-        _center_layout.addWidget(self.tabs, 1)
-
-        # Make tabs look/behave like a left sidebar
-        self.tabs.setTabPosition(QTabWidget.West)
-        self.tabs.setMovable(False)
-        self.tabs.setDocumentMode(True)  # flatter look
-
-        # Sidebar styling
-        self.tabs.setStyleSheet("""
-        /* Sidebar width & spacing */
-        QTabWidget::pane { border: 0; }
-        QTabBar::tab {
-            padding: 10px 14px;
-            margin: 2px 0;
-            min-width: 160px;
-            border-radius: 8px;
-            text-align: left;
-        }
-        QTabBar::tab:selected {
-            background: #2a2f36;
-            color: white;
-            font-weight: 600;
-        }
-        QTabBar::tab:!selected {
-            background: transparent;
-            color: #c8cdd4;
-        }
-        """)
-
-        # Gentle, app-wide widget rounding for cards/panels
-        self.setStyleSheet(self.styleSheet() + """
-        QGroupBox {
-            border: 1px solid #2a2f36; border-radius: 12px; margin-top: 16px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin; left: 8px; padding: 0px 6px 0px 6px;
-        }
-        QTableWidget {
-            gridline-color: #2a2f36;
-        }
-        """)
-
-        self.layout.addWidget(self.tabs)
-
-
+        
         # Dashboard first
         self.dashboard_tab = QWidget()
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
@@ -519,6 +568,73 @@ class FinanceApp(QWidget):
         self.settings_tab = QWidget()
         self.tabs.addTab(self.settings_tab, "Settings")
         self.init_settings_tab()
+        
+        # --- Faux sidebar with horizontal labels (build AFTER all tabs exist) ---
+        self.sidebar = QListWidget()
+        self.sidebar.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.sidebar.setUniformItemSizes(True)
+        self.sidebar.setSpacing(4)
+        self.sidebar.setFixedWidth(180)
+
+        # Mirror current tab labels into the sidebar
+        self.sidebar.clear()
+        for i in range(self.tabs.count()):
+            item = QListWidgetItem(self.tabs.tabText(i))
+            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.sidebar.addItem(item)
+
+        # Keep sidebar and tabs in sync
+        def _side_to_tab(row):
+            if 0 <= row < self.tabs.count():
+                self.tabs.setCurrentIndex(row)
+
+        def _tab_to_side(idx):
+            if 0 <= idx < self.sidebar.count():
+                self.sidebar.setCurrentRow(idx)
+
+        self.sidebar.currentRowChanged.connect(_side_to_tab)
+        self.tabs.currentChanged.connect(_tab_to_side)
+
+        # Hide the real tab bar (we’ll click in the sidebar instead)
+        self.tabs.setTabPosition(QTabWidget.North)  # position irrelevant once hidden
+        self.tabs.tabBar().show()  # show first to avoid Qt quirks
+        self.tabs.tabBar().hide()
+
+        # Container for sidebar + tabs
+        self._center_container = QWidget()
+        _center_layout = QHBoxLayout(self._center_container)
+        _center_layout.setContentsMargins(0, 0, 0, 0)
+        _center_layout.setSpacing(0)
+        _center_layout.addWidget(self.sidebar)
+        _center_layout.addWidget(self.tabs, 1)
+
+        # Ensure something is selected
+        if self.tabs.count() > 0:
+            self.tabs.setCurrentIndex(0)
+            self.sidebar.setCurrentRow(0)
+
+        self.sidebar.setStyleSheet("""
+        QListWidget {
+        border: 0;
+        background: transparent;
+        }
+        QListWidget::item {
+        padding: 10px 12px;
+        margin: 2px 6px;
+        border-radius: 8px;
+        }
+        QListWidget::item:selected {
+        background: #2a2f36;
+        color: #ffffff;
+        font-weight: 600;
+        }
+        QListWidget::item:hover {
+        background: rgba(42,47,54,0.5);
+        }
+        """)
+
+        # Show the container that holds sidebar + tabs
+        self.layout.addWidget(self._center_container)
 
         self.tabs.currentChanged.connect(self.on_tab_change)
 
@@ -651,7 +767,8 @@ class FinanceApp(QWidget):
 
     def load_transactions(self) -> pd.DataFrame:
         cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
-                'AppliedToBalance', 'ExternalId', 'TransferGroup']
+            'AppliedToBalance', 'ExternalId', 'TransferGroup', 'CategorySource']
+
         try:
             df = pd.read_csv(TRANSACTIONS_FILE, dtype=str)
 
@@ -677,6 +794,8 @@ class FinanceApp(QWidget):
                 df.at[i, "Id"] = str(next_id)
                 next_id += 1
 
+
+
         # Dtypes and defaults
         if not df.empty:
             df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
@@ -699,14 +818,26 @@ class FinanceApp(QWidget):
             df['AppliedToBalance'] = df['AppliedToBalance'].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
         else:
             df = pd.DataFrame(columns=cols)
+        
+        # Default empty categories to 'Uncategorized'
+        if "Category" in df.columns:
+            df['Category'] = df['Category'].fillna("").replace("", UNCATEGORIZED)
+        else:
+            df['Category'] = UNCATEGORIZED
+
+        # Ensure CategorySource exists
+        if "CategorySource" not in df.columns:
+            df["CategorySource"] = ""
 
         df = df[['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
          'AppliedToBalance', 'ExternalId', 'TransferGroup']]
+
         return df
 
     def save_transactions(self):
         cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
-            'AppliedToBalance', 'ExternalId', 'TransferGroup']
+            'AppliedToBalance', 'ExternalId', 'TransferGroup', 'CategorySource']
+
         for c in cols:
             if c not in self.df.columns:
                 self.df[c] = ""
@@ -714,6 +845,185 @@ class FinanceApp(QWidget):
         df_out = self.df.copy()
         df_out['AppliedToBalance'] = df_out['AppliedToBalance'].map(lambda x: "True" if bool(x) else "False")
         df_out[cols].to_csv(TRANSACTIONS_FILE, index=False)
+
+        # -------- Sprint 12: Auto-categorize engine --------
+    def _autocat_suggest(self, raw_vendor: str) -> str | None:
+        if not raw_vendor or not self.settings.get("auto_categorize_enabled", True):
+            return None
+
+        thr = float(self.settings.get("auto_categorize_threshold", 0.65))
+        v_full = _normalize_vendor(raw_vendor)
+        v_stem = _vendor_stem(raw_vendor)
+        if not v_full or not self.autocat:
+            return None
+
+        def _best_cat_from_counter(counter):
+            if isinstance(counter, str):
+                return counter
+            if not isinstance(counter, dict) or not counter:
+                return None
+            # pick the category with the highest count
+            return max(counter.items(), key=lambda kv: kv[1])[0]
+
+        # 1) exact full
+        if v_full in self.autocat:
+            return _best_cat_from_counter(self.autocat[v_full])
+        # 2) exact stem
+        if v_stem and v_stem in self.autocat:
+            return _best_cat_from_counter(self.autocat[v_stem])
+
+        # Build candidate list with weights
+        candidates = {}  # cat -> weight
+        for k, counter in self.autocat.items():
+            cat = _best_cat_from_counter(counter)
+            if not cat:
+                continue
+
+            # contains/prefix both ways
+            if v_full.startswith(k) or k in v_full or k.startswith(v_full) or v_full in k:
+                candidates[cat] = candidates.get(cat, 0) + 3  # strong signal
+                continue
+
+            # token overlap
+            ov = _token_overlap(v_full, k)
+            if ov >= 2:
+                candidates[cat] = candidates.get(cat, 0) + 2
+                continue
+
+            # fuzzy
+            score = _sim(v_full, k)
+            if score >= thr:
+                # weight by similarity
+                candidates[cat] = candidates.get(cat, 0) + score
+
+        if not candidates:
+            return None
+        # pick category with max weight
+        return max(candidates.items(), key=lambda kv: kv[1])[0]
+
+
+        thr = float(self.settings.get("auto_categorize_threshold", 0.70))
+        v = _normalize_vendor(raw_vendor)
+        if not v or not self.autocat:
+            return None
+
+        # 1) exact
+        if v in self.autocat:
+            return self.autocat.get(v)
+
+        # 2) prefix/contains
+        for k, cat in self.autocat.items():
+            if v.startswith(k) or k in v:
+                return cat
+
+        # 3) fuzzy
+        best_cat = None
+        best = 0.0
+        for k, cat in self.autocat.items():
+            score = _sim(v, k)
+            if score > best:
+                best = score
+                best_cat = cat
+        return best_cat if best >= thr else None
+
+    def _autocat_update_memory(self, raw_vendor: str, category: str):
+        """Record a manual decision into memory using counters for full & stem keys."""
+        v_full = _normalize_vendor(raw_vendor)
+        v_stem = _vendor_stem(raw_vendor)
+        if not category or category == UNCATEGORIZED:
+            return
+
+        def _bump(key: str):
+            if not key:
+                return
+            cur = self.autocat.get(key)
+            if isinstance(cur, str):  # migrate old format "key": "Category"
+                cur = {cur: 1}
+            if not isinstance(cur, dict):
+                cur = {}
+            cur[category] = int(cur.get(category, 0)) + 1
+            self.autocat[key] = cur
+
+        _bump(v_full)
+        if v_stem and v_stem != v_full:
+            _bump(v_stem)
+
+        try:
+            self.save_json(AUTOCAT_FILE, self.autocat)
+        except Exception:
+            pass
+
+
+    def _autocat_apply_to_uncategorized(self) -> int:
+        """
+        Auto-categorize all rows where Category is empty/Uncategorized.
+        Returns number of rows updated.
+        """
+        if self.df.empty:
+            return 0
+        changed = 0
+        for i, row in self.df.iterrows():
+            cat = str(row.get("Category", "") or "").strip()
+            if cat and cat.lower() != "uncategorized":
+                continue
+            vendor = row.get("Vendor", "")
+            sugg = self._autocat_suggest(vendor)
+            if sugg:
+                self.df.at[i, "Category"] = sugg
+                # mark provenance
+                if "CategorySource" not in self.df.columns:
+                    self.df["CategorySource"] = ""
+                self.df.at[i, "CategorySource"] = "Auto"
+                changed += 1
+        return changed
+
+    def _autocat_backfill_after_manual(self, raw_vendor: str, category: str) -> int:
+        """
+        After a manual assignment, backfill past uncategorized matches.
+        """
+        self._autocat_update_memory(raw_vendor, category)
+        return self._autocat_apply_to_uncategorized()
+    
+    def _autocat_migrate_auto_rows(self, raw_vendor: str, target_category: str, min_confirmations: int = 2) -> int:
+        """
+        If we have >= min_confirmations for target_category on this vendor,
+        migrate *AUTO* rows that match (by our matching rules) to the new category.
+        """
+        # Check confirmations on keys (full + stem)
+        v_full = _normalize_vendor(raw_vendor)
+        v_stem = _vendor_stem(raw_vendor)
+
+        def _count_for(key):
+            cur = self.autocat.get(key)
+            if isinstance(cur, dict):
+                return int(cur.get(target_category, 0))
+            if isinstance(cur, str):
+                return 1 if cur == target_category else 0
+            return 0
+
+        conf = _count_for(v_full) + (0 if v_stem == v_full else _count_for(v_stem))
+        if conf < min_confirmations:
+            return 0
+
+        # Migrate AUTO rows only
+        changed = 0
+        for i, row in self.df.iterrows():
+            # Only touch uncategorized or auto rows (don't touch Manual)
+            src = str(row.get("CategorySource", "") or "")
+            if src.lower() == "manual":
+                continue
+
+            vendor = row.get("Vendor", "")
+            # Reuse our suggestor to determine if this row matches the same vendor family
+            sugg = self._autocat_suggest(vendor)
+            if sugg == target_category:
+                if str(row.get("Category", "")) != target_category:
+                    self.df.at[i, "Category"] = target_category
+                    self.df.at[i, "CategorySource"] = "Auto"
+                    changed += 1
+
+        return changed
+
 
     def repair_transaction_ids(self, save: bool = False):
         """
@@ -830,7 +1140,6 @@ class FinanceApp(QWidget):
         # ---- Table
         self.table = QTableWidget()
         # Make selection operate on full rows (so Edit/Delete can find the right Id)
-        from PySide6.QtWidgets import QAbstractItemView  # ok to repeat import; or move to top
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
@@ -843,6 +1152,16 @@ class FinanceApp(QWidget):
         self.delete_button = QPushButton("Delete")
         self.clear_tx_button = QPushButton("Clear All")  # NEW Sprint 6
         self.mark_transfer_button = QPushButton("Mark Transfer") # Sprint 10
+        self.run_autocat_button = QPushButton("Auto-Categorize Now")  # Sprint 12 test button
+        # respect settings default visibility
+        try:
+            self.run_autocat_button.setVisible(bool(self.settings.get("show_autocat_button", False)))
+        except Exception:
+            pass
+
+        # >>> Dedicated Import button Sprint 14<<<
+        self.import_button = QPushButton("Import Transactions…")  
+        btn_row.addWidget(self.import_button)                      
 
         btn_row.addWidget(self.add_button)
         btn_row.addWidget(self.edit_button)
@@ -852,6 +1171,8 @@ class FinanceApp(QWidget):
         btn_row.addSpacing(8)
         btn_row.addWidget(self.mark_transfer_button)  # NEW sprint 10
         btn_row.addStretch()
+        btn_row.addWidget(self.run_autocat_button)  # Sprint 12 test button
+
         layout.addLayout(btn_row)
 
         self.summary_label = QLabel()
@@ -864,11 +1185,14 @@ class FinanceApp(QWidget):
         self.txn_filter_to_picker.dateChanged.connect(self.on_txn_filter_changed)
         self.txn_sort_dropdown.currentTextChanged.connect(self.on_txn_sort_changed)
 
+        self.import_button.clicked.connect(self.open_import_wizard)      # Sprint 14
         self.add_button.clicked.connect(self.add_transaction)
         self.edit_button.clicked.connect(self._edit_selected_transaction)
         self.delete_button.clicked.connect(self._delete_selected_transaction)
-        self.clear_tx_button.clicked.connect(self.clear_all_transactions)  # NEW
+        self.clear_tx_button.clicked.connect(self.clear_all_transactions)
         self.mark_transfer_button.clicked.connect(self._mark_selected_as_transfer) # Sprint 10
+        self.run_autocat_button.clicked.connect(self._run_autocat_now) # Sprint 12
+
 
         self.trans_tab.setLayout(layout)
         
@@ -998,6 +1322,18 @@ class FinanceApp(QWidget):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 else:
                     item = QTableWidgetItem(str(val))
+                    # Sprint 12: if this is the Category column and source is Auto, italicize + tooltip
+                    if col == "Category":
+                        try:
+                            # Use the underlying sorted_df to read CategorySource for this row
+                            src = str(sorted_df.iloc[r].get("CategorySource", "") or "")
+                            if src.lower() == "auto":
+                                font = item.font()
+                                font.setItalic(True)
+                                item.setFont(font)
+                                item.setToolTip("Auto-categorized")
+                        except Exception:
+                            pass
                 self.table.setItem(r, c, item)
 
         # Hide Id column
@@ -1026,7 +1362,7 @@ class FinanceApp(QWidget):
         except Exception:
             return
 
-        for name in ["AppliedToBalance", "ExternalId", "TransferGroup"]:
+        for name in ["AppliedToBalance", "ExternalId", "TransferGroup", "CategorySource"]:
             if name in header_to_idx:
                 self.table.setColumnHidden(header_to_idx[name], not show)
 
@@ -1097,13 +1433,23 @@ class FinanceApp(QWidget):
             "Account": new["Account"],
             "AppliedToBalance": False,
             "ExternalId": "",
-            "TransferGroup": ""
+            "TransferGroup": "",
+            "CategorySource": "Manual"
         }
 
         self.df.loc[len(self.df)] = new_row
         self.save_and_refresh()
     
     def refresh_all(self):
+        # Sprint 12: apply auto-categorization to any uncategorized rows
+        try:
+            changed = self._autocat_apply_to_uncategorized()
+            if changed:
+                # Persist silently; UI refresh follows below
+                self.save_transactions()
+        except Exception:
+            pass
+
         """UI refresh hook used by the import wizard."""
         # Do NOT save here; just refresh views from current in-memory data.
         self.update_table()
@@ -1172,6 +1518,23 @@ class FinanceApp(QWidget):
             self._delete_transaction_by_id(row_id)
         elif action == a_tx:
             self._mark_selected_as_transfer()  # NEW sprint 10
+
+    def _run_autocat_now(self):
+        """Manually trigger auto-categorization/backfill over uncategorized rows."""
+        try:
+            if not self.settings.get("auto_categorize_enabled", True):
+                QMessageBox.information(self, "Auto-Categorize", "Auto-categorization is disabled in Settings.")
+                return
+            changed = self._autocat_apply_to_uncategorized()
+            if changed:
+                self.save_transactions()
+                self.update_table()
+                self.update_summary()
+                QMessageBox.information(self, "Auto-Categorize", f"Auto-categorized {changed} transaction(s).")
+            else:
+                QMessageBox.information(self, "Auto-Categorize", "No uncategorized matches found.")
+        except Exception as e:
+            QMessageBox.warning(self, "Auto-Categorize", f"Could not complete auto-categorization:\n{e}")
 
     def _mark_selected_as_transfer(self):
         # Gather exactly two selected rows
@@ -1257,7 +1620,8 @@ class FinanceApp(QWidget):
 
         # Recreate empty dataframe with the expected columns
         cols = ['Id', 'Date', 'Vendor', 'Amount', 'Type', 'Category', 'Account',
-        'AppliedToBalance', 'ExternalId', 'TransferGroup']
+            'AppliedToBalance', 'ExternalId', 'TransferGroup', 'CategorySource']
+
         self.df = pd.DataFrame(columns=cols)
         self.save_and_refresh()
         QMessageBox.information(self, "Transactions", "All transactions cleared.")
@@ -1302,6 +1666,28 @@ class FinanceApp(QWidget):
         self.df.at[i, 'Type'] = t
         self.df.at[i, 'Category'] = new['Category']
         self.df.at[i, 'Account'] = new['Account']
+       
+        # Mark provenance for manual edit
+        if "CategorySource" not in self.df.columns:
+            self.df["CategorySource"] = ""
+        self.df.at[i, "CategorySource"] = "Manual"
+
+        # Sprint 12: backfill uncategorized matches after this manual assignment
+        try:
+            backfilled = self._autocat_backfill_after_manual(new['Vendor'], new['Category'])
+            if backfilled:
+                self.save_json(AUTOCAT_FILE, self.autocat)
+        except Exception:
+            pass
+        
+        # After backfill, consider migrating past AUTO rows if we have enough confirmations
+        try:
+            migrated = self._autocat_migrate_auto_rows(new['Vendor'], new['Category'], min_confirmations=2)
+            if migrated:
+                self.save_transactions()
+        except Exception:
+            pass
+
         # Keep AppliedToBalance as-is for edited row
         self.save_and_refresh()
 
@@ -1318,6 +1704,15 @@ class FinanceApp(QWidget):
         self.save_and_refresh()
 
     def save_and_refresh(self):
+        # Sprint 12: opportunistic auto-categorize before save/refresh
+        try:
+            changed = self._autocat_apply_to_uncategorized()
+            if changed:
+                # mark will be saved with the main save below
+                pass
+        except Exception:
+            pass
+
         self.save_transactions()
         self.update_table()
         self.update_summary()
@@ -1325,6 +1720,7 @@ class FinanceApp(QWidget):
         self.update_budgets_table()
         self.update_dashboard_tab()
         self.refresh_reports()
+
 
     # ---------------- Budgets Tab ----------------
     def init_budgets_tab(self):
@@ -1353,13 +1749,30 @@ class FinanceApp(QWidget):
         self.update_budgets_table()
 
     def _all_categories_for_budget(self):
-        # Only Expense categories make sense for budgets
-        cats = set(self.get_category_names_by_type("Expense"))
-        # Make sure any existing budget keys remain visible
-        cats |= set(self.budgets.keys())
-        return sorted(cats)
+        """
+        Only show categories that actually have a budget > 0 set.
+        (Hides zero/empty budgets and categories without a budget.)
+        """
+        out = []
+        for cat, data in (self.budgets or {}).items():
+            amt = 0.0
+            if isinstance(data, dict):
+                try:
+                    amt = float(data.get("amount", 0) or 0)
+                except Exception:
+                    amt = 0.0
+            # keep only positive budgets
+            if amt > 0:
+                out.append(cat)
+        return sorted(set(out))
+
 
     def update_budgets_table(self):
+        # One-time cleanup: remove budgets for system categories (e.g., Transfer)
+        if any(is_system_category(k) for k in (self.budgets or {}).keys()):
+            self.budgets = {k: v for k, v in self.budgets.items() if not is_system_category(k)}
+            self.save_json(BUDGET_FILE, self.budgets)
+
         all_cats = self._all_categories_for_budget()
         today = self.get_today()
 
@@ -1368,23 +1781,33 @@ class FinanceApp(QWidget):
             self.budget_table.setItem(r, 0, QTableWidgetItem(cat))
             bdata = self.budgets.get(cat)
             if isinstance(bdata, dict):
+                try:
+                    amount = float(bdata.get("amount", 0) or 0)
+                except Exception:
+                    amount = 0.0
+                if amount <= 0:
+                    # skip rendering this row defensively
+                    continue
+
                 period_code = (bdata.get("period") or "monthly").lower()
                 period = period_code.capitalize()
-                amount = bdata.get("amount", 0.0)
                 monthly_eq = self.monthly_equivalent(float(amount), period_code, today)
+
                 self.budget_table.setItem(r, 1, QTableWidgetItem(period))
                 amt_item = QTableWidgetItem(fmt_money(amount))
                 amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.budget_table.setItem(r, 2, amt_item)
+
                 me_item = QTableWidgetItem(fmt_money(monthly_eq))
                 me_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.budget_table.setItem(r, 3, me_item)
             else:
+                # (Shouldn’t happen with new _all_categories_for_budget, but safe.)
                 self.budget_table.setItem(r, 1, QTableWidgetItem("—"))
                 self.budget_table.setItem(r, 2, QTableWidgetItem("None"))
                 self.budget_table.setItem(r, 3, QTableWidgetItem("—"))
 
-        self.budget_table.resizeColumnsToContents()
+            self.budget_table.resizeColumnsToContents()
 
     def add_edit_budget(self):
         cats_expense = self.get_category_names_by_type("Expense")
@@ -1393,6 +1816,11 @@ class FinanceApp(QWidget):
             return
         data = dialog.getData()
         cat = data["Category"].strip() or UNCATEGORIZED
+        # Do not allow budgets for system categories (e.g., Transfer)
+        if is_system_category(cat):
+            QMessageBox.warning(self, "Budget", f"'{cat}' is a system category and cannot have a budget.")
+            return
+
         try:
             amt = float(data["Amount"])
         except ValueError:
@@ -1936,6 +2364,13 @@ class FinanceApp(QWidget):
         df = self.df.copy()
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
+        
+        # NEW: exclude transfers from dashboard/report spend math Sprint 13
+        if 'Type' in df.columns:
+            df = df[df['Type'].astype(str).str.lower() != 'transfer']
+        if 'Category' in df.columns:
+            df = df[df['Category'].astype(str).str.lower() != 'transfer']
+
         if df.empty:
             return {}
         df['Category'] = df['Category'].astype(str)
@@ -1948,6 +2383,11 @@ class FinanceApp(QWidget):
         df = self.df.copy()
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
+
+        # NEW: exclude transfers
+        if 'Type' in df.columns:
+            df = df[df['Type'].astype(str).str.lower() != 'transfer']
+
         if df.empty:
             return {}
         df['Account'] = df['Account'].fillna("Unassigned")
@@ -1961,6 +2401,11 @@ class FinanceApp(QWidget):
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
         df = df.sort_values('Date', ascending=False)
+
+        # NEW: exclude transfers from dashboard recent list
+        if 'Type' in df.columns:
+            df = df[df['Type'].astype(str).str.lower() != 'transfer']
+
         return df.head(n).reset_index(drop=True)
 
     def _draw_donut(self, ax, labels, values, center_text):
@@ -2029,6 +2474,10 @@ class FinanceApp(QWidget):
 
         # Range
         start, end = self.compute_dashboard_range()
+        # Exclude transfers from dashboard spend/income
+        df = self.df.copy()
+        df = df[df['Type'] != 'Transfer']
+
 
         # Budgets summary: ONLY budgeted categories; spent within range; budget = monthly eq (subtitle explains)
         today = self.get_today()
@@ -2317,6 +2766,70 @@ class FinanceApp(QWidget):
         self.btn_reset_today.clicked.connect(self.on_reset_today)
 
         self.update_settings_info()
+
+        #Sprint 13: Re-seed categories
+        self.btn_seed_data = QPushButton("Re-seed default categories & Ontario vendor map")
+        layout.addWidget(self.btn_seed_data)
+
+        def _on_seed_data():
+            try:
+                cpath = _project_path("seeds", "categories_seed.json")
+                apath = _project_path("seeds", "autocategorize_seed_on_ca.json")
+                # categories
+                merged_c = _merge_seed_categories_from_file(self.categories, cpath)
+                if merged_c != self.categories:
+                    self.categories = merged_c
+                    self.save_json("categories.json", self.categories)
+                # autocat
+                merged_a = _merge_seed_autocat_from_file(self.autocat, apath)
+                if merged_a != self.autocat:
+                    self.autocat = merged_a
+                    self.save_json(AUTOCAT_FILE, self.autocat)
+
+                # light feedback
+                QMessageBox.information(self, "Seed Data", "Seed data merged. New defaults added if missing.")
+                # optional: refresh budgets/categories UIs if present
+                try: self.update_budgets_table()
+                except Exception: pass
+            except Exception as e:
+                QMessageBox.warning(self, "Seed Data", f"Could not merge seed data:\n{e}")
+
+        self.btn_seed_data.clicked.connect(_on_seed_data)
+
+
+        # --- Sprint 12: Auto-categorization toggle ---
+        self.chk_show_autocat_button = QCheckBox("Show 'Auto-Categorize Now' button (for testing)")
+        show_btn = bool(self.settings.get("show_autocat_button", False))
+        self.chk_show_autocat_button.setChecked(show_btn)
+        layout.addWidget(self.chk_show_autocat_button)
+
+        def _on_toggle_autocat_btn(checked):
+            self.settings["show_autocat_button"] = bool(checked)
+            self.save_json(SETTINGS_FILE, self.settings)
+            try:
+                self.run_autocat_button.setVisible(bool(checked))
+            except Exception:
+                pass
+
+        self.chk_show_autocat_button.toggled.connect(_on_toggle_autocat_btn)
+
+        self.chk_auto_cat = QCheckBox("Enable auto-categorization of transactions (experimental)")
+        auto_on = bool(self.settings.get("auto_categorize_enabled", True))
+        self.chk_auto_cat.setChecked(auto_on)
+        layout.addWidget(self.chk_auto_cat)
+
+        def _on_toggle_auto_cat(checked):
+            self.settings["auto_categorize_enabled"] = bool(checked)
+            self.save_json(SETTINGS_FILE, self.settings)
+            if checked:
+                # apply immediately to any uncategorized rows
+                changed = self._autocat_apply_to_uncategorized()
+                if changed:
+                    self.save_transactions()
+                    self.update_table()
+
+        self.chk_auto_cat.toggled.connect(_on_toggle_auto_cat)
+
 
         # --- Sprint 11: debug toggle for advanced transaction columns ---
         self.chk_show_adv_cols = QCheckBox("Show advanced transaction columns (AppliedToBalance, ExternalId, TransferGroup)")

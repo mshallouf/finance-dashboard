@@ -3,12 +3,14 @@ import os, json, shutil, datetime
 import pandas as pd
 from datetime import datetime as dt
 
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
     QMessageBox, QFormLayout, QGroupBox, QDateEdit, QDialogButtonBox,
-    QCheckBox, QStackedWidget, QAbstractItemView
+    QCheckBox, QStackedWidget, QAbstractItemView, QWidget   # <— added QWidget
 )
+
 
 from PySide6.QtCore import Qt
 
@@ -193,10 +195,24 @@ class ImportWizard(QDialog):
         self.s2 = s2  # keep a reference to Step-2 form layout for later additions
 
 
+        # ====== Sprint 14: streamlined Step 2 (essentials + collapsible Advanced) ======
+        # --- Controls (same variables as before; we’re just reorganizing layout) ---
         self.map_date = QComboBox(); self.map_vendor = QComboBox()
+
+        # Amount mode + fields
         self.amount_mode = QComboBox(); self.amount_mode.addItems(["Single Amount column", "Debit/Credit columns"])
         self.map_amount = QComboBox(); self.map_debit = QComboBox(); self.map_credit = QComboBox()
 
+        # Quick “flip signs” control (kept visible per user request: “positive vs negative”)
+        if not hasattr(self, "chk_flip_signs"):
+            self.chk_flip_signs = QCheckBox("Flip amounts so expenses become negative")
+            self.chk_flip_signs.setToolTip(
+                "Enable this if your file uses credit-card style: purchases are positive and payments are negative.\n"
+                "When checked, the wizard will multiply all Amounts by -1 before import."
+            )
+            self.chk_flip_signs.toggled.connect(self._rebuild_preview_if_on_step3)
+
+        # Advanced-only controls (we’ll add them into the collapsible panel)
         self.date_format = QComboBox()
         for label, _fmt in DATE_FORMAT_CHOICES: self.date_format.addItem(label)
 
@@ -211,61 +227,100 @@ class ImportWizard(QDialog):
         self.account_combo.addItems([a["name"] for a in self.app.accounts] + ["➕ Add new account…"])
         self.account_combo.currentTextChanged.connect(self.on_account_changed)
 
-        self.chk_remember = QCheckBox("Remember this mapping as a profile")
-        self.profile_name_edit = QLineEdit(); self.profile_name_edit.setPlaceholderText("Profile name")
-
-        s2.addRow(QLabel("<b>Required</b>"))
-        s2.addRow("Date column:", self.map_date)
-        s2.addRow("Vendor/Description column:", self.map_vendor)
-        s2.addRow("Amount mode:", self.amount_mode)
-        s2.addRow("Amount column (if single):", self.map_amount)
-        s2.addRow("Debit column (if D/C):", self.map_debit)
-        s2.addRow("Credit column (if D/C):", self.map_credit)
-
-        s2.addRow(QLabel("<b>Date & Amount Options</b>"))
-        s2.addRow("Date format:", self.date_format)
-        s2.addRow(self.chk_strip_currency)
-        s2.addRow(self.chk_paren_negative)
-        s2.addRow(self.chk_thousands)
-        s2.addRow(self.chk_invert)
-
-        s2.addRow(QLabel("<b>Optional</b>"))
-        s2.addRow("Memo/Notes:", self.map_memo)
-        s2.addRow("External Id:", self.map_external_id)
-        s2.addRow("Balance:", self.map_balance)
-        s2.addRow("Type:", self.map_type)
-
-        s2.addRow(QLabel("<b>Assign to Account (all rows)</b>"))
-        s2.addRow("Account:", self.account_combo)
-
-        # ----- New controls for Sprint 9 -----
-        # Account Type (only used if a new account is being created / or to tag an existing one)
+        # Account Type (used on new account creation; moved to Advanced)
         self.account_type_combo = QComboBox()
         self.account_type_combo.addItems(["Asset", "Credit Card"])
         self.account_type_combo.setToolTip("Used when creating a new account here. Optional for existing accounts.")
-        s2.addRow("Account Type:", self.account_type_combo)
 
-        # Account Initialization group
+        # Account Initialization group (Advanced)
         self.init_group = QGroupBox("Account Initialization")
         init_layout = QFormLayout(self.init_group)
-
         self.chk_init_from_import = QCheckBox("Initialize account balance from this import")
         self.chk_init_from_import.setChecked(False)
-
         self.init_net_label = QLabel("Computed net from this import: —")  # updated in preview
         self.override_balance_edit = QLineEdit()
         self.override_balance_edit.setPlaceholderText("Optional. Example: -2400 (use instead of computed net)")
-
         init_layout.addRow(self.chk_init_from_import)
         init_layout.addRow("Computed net:", self.init_net_label)
         init_layout.addRow("Override balance:", self.override_balance_edit)
 
-        s2.addRow(self.init_group)
-        # ----- End new controls -----
+        # Profiles (Advanced)
+        self.chk_remember = QCheckBox("Remember this mapping as a profile")
+        self.profile_name_edit = QLineEdit(); self.profile_name_edit.setPlaceholderText("Profile name")
 
-        s2.addRow(QLabel("<b>Profile</b>"))
-        s2.addRow(self.chk_remember)
-        s2.addRow("Profile name:", self.profile_name_edit)
+        # ---- Essentials rows (with green ✓ when auto-mapped) ----
+        def _row_with_icon(widget):
+            holder = QWidget()
+            h = QHBoxLayout(holder); h.setContentsMargins(0,0,0,0)
+            h.addWidget(widget); icon = QLabel("✓"); icon.setToolTip("Auto-mapped / complete")
+            icon.setStyleSheet("color:#1b8f3a; font-weight:bold;")
+            icon.setFixedWidth(16); icon.setAlignment(Qt.AlignCenter); icon.setVisible(False)
+            h.addWidget(icon)
+            return holder, icon
+
+        date_row, self.icon_date = _row_with_icon(self.map_date)
+        vendor_row, self.icon_vendor = _row_with_icon(self.map_vendor)
+
+        # Amount cluster (mode + conditional fields share one row label)
+        amt_widget = QWidget(); amt_layout = QHBoxLayout(amt_widget); amt_layout.setContentsMargins(0,0,0,0)
+        amt_layout.addWidget(self.amount_mode)
+        amt_layout.addWidget(QLabel(" | Amount:"))
+        amt_layout.addWidget(self.map_amount)
+        amt_layout.addWidget(QLabel(" | Debit:"))
+        amt_layout.addWidget(self.map_debit)
+        amt_layout.addWidget(QLabel("Credit:"))
+        amt_layout.addWidget(self.map_credit)
+        amt_layout.addWidget(QLabel(" | "))
+        amt_layout.addWidget(self.chk_flip_signs)
+        amt_row, self.icon_amount = _row_with_icon(amt_widget)
+
+        acct_row, self.icon_account = _row_with_icon(self.account_combo)
+
+        # Build essentials into Step-2 form
+        s2.addRow(QLabel("<b>Required</b>"))
+        s2.addRow("Date column:", date_row)
+        s2.addRow("Vendor/Description column:", vendor_row)
+        s2.addRow("Amount mapping:", amt_row)
+        s2.addRow("Account:", acct_row)
+
+        # ---- Collapsible Advanced panel ----
+        self.adv_toggle = QPushButton("Show Advanced ▸")
+        self.adv_toggle.setCheckable(True); self.adv_toggle.setChecked(False)
+        self.adv_toggle.setStyleSheet("text-align:left; padding:6px;")
+        s2.addRow(self.adv_toggle)
+
+        self.adv_container = QWidget()
+        adv = QFormLayout(self.adv_container)
+
+        adv.addRow(QLabel("<b>Date & Amount Options</b>"))
+        adv.addRow("Date format:", self.date_format)
+        adv.addRow(self.chk_strip_currency)
+        adv.addRow(self.chk_paren_negative)
+        adv.addRow(self.chk_thousands)
+        adv.addRow(self.chk_invert)
+
+        adv.addRow(QLabel("<b>Optional Columns</b>"))
+        adv.addRow("Memo/Notes:", self.map_memo)
+        adv.addRow("External Id:", self.map_external_id)
+        adv.addRow("Balance:", self.map_balance)
+        adv.addRow("Type:", self.map_type)
+
+        adv.addRow(QLabel("<b>Account Settings</b>"))
+        adv.addRow("Account Type:", self.account_type_combo)
+        adv.addRow(self.init_group)
+
+        adv.addRow(QLabel("<b>Profile</b>"))
+        adv.addRow(self.chk_remember)
+        adv.addRow("Profile name:", self.profile_name_edit)
+
+        s2.addRow(self.adv_container)
+        self.adv_container.setVisible(False)
+
+        def _toggle_advanced(checked):
+            self.adv_container.setVisible(checked)
+            self.adv_toggle.setText("Hide Advanced ▾" if checked else "Show Advanced ▸")
+        self.adv_toggle.toggled.connect(_toggle_advanced)
+        # ====== End Sprint 14 Step 2 block ======
 
         self.amount_mode.currentTextChanged.connect(self.on_amount_mode_changed)
 
@@ -286,6 +341,12 @@ class ImportWizard(QDialog):
         self.btn_back.setEnabled(idx > 0)
         self.btn_next.setEnabled(idx < self.stack.count() - 1)
         self.btn_import.setEnabled(idx == self.stack.count() - 1)
+        # Friendly label: Step 2 points to Preview
+        if idx == 1:
+            self.btn_next.setText("Next → Preview")
+        else:
+            self.btn_next.setText("Next")
+
 
     def on_back(self):
         self.stack.setCurrentIndex(self.stack.currentIndex() - 1)
@@ -387,6 +448,21 @@ class ImportWizard(QDialog):
             # Optional: live-update preview if user is on Step 3
             self.chk_flip_signs.toggled.connect(self._rebuild_preview_if_on_step3)
 
+        # Sprint 14: connect change signals to update green ✓ once
+        if not getattr(self, "_req_icon_signals_connected", False):
+            self.map_date.currentTextChanged.connect(self._update_required_icons)
+            self.map_vendor.currentTextChanged.connect(self._update_required_icons)
+            self.map_amount.currentTextChanged.connect(self._update_required_icons)
+            self.map_debit.currentTextChanged.connect(self._update_required_icons)
+            self.map_credit.currentTextChanged.connect(self._update_required_icons)
+            self.amount_mode.currentTextChanged.connect(self._update_required_icons)
+            self.account_combo.currentTextChanged.connect(self._update_required_icons)
+            self._req_icon_signals_connected = True
+
+        # Initial tick state now that combos are filled
+        if hasattr(self, "_update_required_icons"):
+            self._update_required_icons()
+
 
         # account default
         if self.app.accounts:
@@ -401,10 +477,45 @@ class ImportWizard(QDialog):
 
     def on_amount_mode_changed(self, txt):
         is_single = txt.startswith("Single")
-        self.map_amount.setEnabled(is_single)
-        self.map_debit.setEnabled(not is_single)
-        self.map_credit.setEnabled(not is_single)
-        self._rebuild_preview_if_on_step3()  # NEW Sprint 9
+
+        # Toggle visibility of fields inside the Amount cluster
+        self.map_amount.setVisible(is_single)
+        # Hide its " | Amount:" label too (it’s the item right before map_amount)
+        self.map_amount.parentWidget().layout().itemAt(1).widget().setVisible(is_single)
+
+        self.map_debit.setVisible(not is_single)
+        self.map_credit.setVisible(not is_single)
+        # Hide their labels too (they’re just before each field)
+        self.map_debit.parentWidget().layout().itemAt(3).widget().setVisible(not is_single)
+        self.map_credit.parentWidget().layout().itemAt(5).widget().setVisible(not is_single)
+
+        # Flip-signs control stays visible in both modes
+
+        # Rebuild preview if on Step 3
+        self._rebuild_preview_if_on_step3()
+
+        if hasattr(self, "_update_required_icons"):
+            self._update_required_icons()
+
+
+    # Sprint 14: show green ✓ when essentials are mapped/complete
+    def _update_required_icons(self):
+        try:
+            self.icon_date.setVisible(bool(self.map_date.currentText().strip()))
+            self.icon_vendor.setVisible(bool(self.map_vendor.currentText().strip()))
+            # Amount considered “ready” if (single & amount chosen) OR (DC & at least one of debit/credit chosen)
+            if self.amount_mode.currentText().startswith("Single"):
+                amt_ok = bool(self.map_amount.currentText().strip())
+            else:
+                amt_ok = bool(self.map_debit.currentText().strip() or self.map_credit.currentText().strip())
+            self.icon_amount.setVisible(amt_ok)
+            # Account ✓ when a real account (not the “Add new…” sentinel) is selected
+            acct = self.account_combo.currentText().strip()
+            self.icon_account.setVisible(bool(acct and not acct.startswith("➕")))
+        except Exception:
+            # Icons are purely cosmetic; fail-safe if widgets are not ready
+            pass
+
 
     def on_account_changed(self, val):
         if val == "➕ Add new account…":
