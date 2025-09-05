@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "vendors": {
+    "zehrs": "Groceries", "loblaws": "Groceries", "no frills": "Groceries", "food basics": "Groceries",
+    "metro": "Groceries", "freshco": "Groceries", "longos": "Groceries", "costco": "Groceries", "walmart": "Groceries",
+
+    "shoppers drug mart": "Pharmacy", "rexall": "Pharmacy", "pharmasave": "Pharmacy",
+
+    "petro canada": "Gas", "esso": "Gas", "shell": "Gas", "canadian tire gas": "Gas", "pioneer": "Gas", "ultramar": "Gas",
+    "mr lube": "Maintenance", "jiffy lube": "Maintenance", "midas": "Maintenance", "canadian tire": "Maintenance",
+
+    "home depot": "Home Goods", "rona": "Home Goods", "lowe s": "Home Goods", "home hardware": "Home Goods",
+    "best buy": "Electronics", "the source": "Electronics",
+
+    "tim hortons": "Coffee", "starbucks": "Coffee", "second cup": "Coffee", "balzac s": "Coffee",
+
+    "mcdonald s": "Fast Food", "a w": "Fast Food", "burger king": "Fast Food", "subway": "Fast Food",
+    "kfc": "Fast Food", "popeyes": "Fast Food", "mary brown s": "Fast Food", "harvey s": "Fast Food",
+    "wendy s": "Fast Food", "five guys": "Fast Food", "domino s": "Fast Food", "pizza pizza": "Fast Food",
+
+    "boston pizza": "Restaurants", "swiss chalet": "Restaurants", "east side mario s": "Restaurants",
+    "milestones": "Restaurants", "the keg": "Restaurants", "moxies": "Restaurants",
+
+    "uber eats": "Delivery", "skip the dishes": "Delivery", "doordash": "Delivery",
+
+    "guelph transit": "Public Transit", "grand river transit": "Public Transit", "go transit": "Public Transit", "presto": "Public Transit",
+    "city of guelph parking": "Parking", "park mobile": "Parking", "uber": "Ride Share", "lyft": "Ride Share",
+
+    "enbridge": "Utilities", "hydro one": "Utilities", "alectra": "Utilities",
+
+    "rogers": "Internet", "bell": "Internet", "teksavvy": "Internet", "cogeco": "Internet",
+    "rogers wireless": "Mobile", "bell mobility": "Mobile", "telus": "Mobile", "koodo": "Mobile",
+    "fido": "Mobile", "freedom mobile": "Mobile", "virgin plus": "Mobile",
+
+    "td insurance": "Home Insurance", "intact insurance": "Home Insurance", "rbc insurance": "Home Insurance",
+    "belairdirect": "Home Insurance", "allstate": "Home Insurance",
+
+    "td": "Bank Fees", "rbc": "Bank Fees", "scotiabank": "Bank Fees", "bmo": "Bank Fees",
+    "cibc": "Bank Fees", "tangerine": "Bank Fees", "simplii": "Bank Fees",
+
+    "cineplex": "Entertainment",
+    "via rail": "Travel", "air canada": "Travel", "westjet": "Travel",
+    "petsmart": "Pet Food", "pet valu": "Pet Food", "goodlife fitness": "Fitness",
+
+    "netflix": "Subscriptions", "spotify": "Subscriptions", "apple": "Subscriptions", "google": "Subscriptions",
+    "microsoft": "Subscriptions", "adobe": "Subscriptions", "amazon prime": "Subscriptions"
+  }
+}

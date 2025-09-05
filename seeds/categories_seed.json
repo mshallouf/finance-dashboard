@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "categories": [
+    { "name": "Salary" }, { "name": "Bonus" }, { "name": "Investment Income" }, { "name": "Refunds" },
+
+    { "name": "Rent/Mortgage" }, { "name": "Utilities" }, { "name": "Internet" }, { "name": "Mobile" },
+    { "name": "Home Insurance" }, { "name": "Repairs" },
+
+    { "name": "Gas" }, { "name": "Public Transit" }, { "name": "Ride Share" }, { "name": "Parking" },
+    { "name": "Auto Insurance" }, { "name": "Maintenance" },
+
+    { "name": "Groceries" },
+    { "name": "Restaurants" },
+    { "name": "Fast Food" },             
+
+    { "name": "Coffee" }, { "name": "Delivery" },
+
+    { "name": "Pharmacy" }, { "name": "Health Insurance" }, { "name": "Dental" }, { "name": "Vision" }, { "name": "Fitness" },
+
+    { "name": "Clothing" }, { "name": "Electronics" }, { "name": "Home Goods" },
+
+    { "name": "Bank Fees" }, { "name": "Interest Charges" }, { "name": "Subscriptions" },
+
+    { "name": "Entertainment" }, { "name": "Travel" }, { "name": "Gifts" }, { "name": "Education" },
+
+    { "name": "Childcare" }, { "name": "School" }, { "name": "Pet Food" }, { "name": "Vet" },
+
+    { "name": "Donations" }, { "name": "Uncategorized" }, { "name": "Transfer" }
+  ]
+}
